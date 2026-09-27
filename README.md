@@ -611,3 +611,66 @@ they are not in git.
   one hour, one day, and weekly.
 - `DOWNLOAD_LINK_TTL_MINUTES` controls new temporary links. Legacy
   `DOWNLOAD_LINK_TTL_HOURS` values are ignored.
+
+## Optional automatic TikTok LIVE recording
+
+The backend can automatically record TikTok LIVEs from accounts already on
+your watchlist. This feature is disabled by default and runs independently
+of normal post and Story monitoring.
+
+LIVE recording requires yt-dlp and FFmpeg/FFprobe, which are included in
+the project's Docker image. Configure TikTok cookies or a yt-dlp proxy
+using the existing settings if your account requires them.
+
+### Enable recording
+
+Copy the relevant settings from `.env.example` into your `.env`:
+
+```dotenv
+LIVE_RECORDING_ENABLED=true
+LIVE_RECORDING_HANDLES=example_creator
+DISCORD_LIVE_CHANNEL_ID=
+LIVE_POLL_SECONDS=120
+LIVE_MAX_CONCURRENT=2
+LIVE_PROBE_CONCURRENCY=2
+LIVE_PROBE_TIMEOUT_SECONDS=35
+LIVE_MIN_FREE_GB=10
+LIVE_MAX_HOURS=8
+```
+
+`LIVE_RECORDING_HANDLES` accepts a comma-separated list of TikTok usernames
+that are already on your watchlist. Leave it empty to check all watched
+TikTok accounts. The default polling interval is 120 seconds, with a
+minimum of 60 seconds.
+
+Set `DISCORD_LIVE_CHANNEL_ID` to send LIVE notifications to a dedicated
+Discord channel. If left empty, notifications use existing watch or
+subscription channels.
+
+After changing `.env`, recreate the bot container to apply the settings:
+
+```powershell
+docker compose up -d --build tiktok-discord-downloader
+```
+
+### Recording and recovery
+
+A recording begins when yt-dlp detects an active LIVE. The bot sends a
+start notification after video data has been written. When recording
+finishes, it verifies the captured media, attempts a lossless remux and
+saves the result in the existing media archive. A completion notification
+contains a permanent archive link.
+
+Recordings are stored under
+`data/downloads/lives/<username>/<YYYY-MM-DD>/`.
+Recovery journals and temporary recording files are stored under
+`data/live/`. If the container stops during a recording, the next
+startup attempts to recover and archive the captured footage.
+
+`LIVE_MIN_FREE_GB` sets the free-space threshold checked before and during
+recording. `LIVE_MAX_HOURS` limits each recording session's length; an
+ongoing broadcast can be detected again on a subsequent poll.
+
+This initial implementation uses yt-dlp for LIVE detection and capture.
+Adaptive quality selection and alternative webcast detection are not
+included in this feature.

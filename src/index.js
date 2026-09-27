@@ -16,6 +16,8 @@ import { normalizePlatform } from './platforms/references.js';
 import { cleanupExpiredDownloads } from './cleanup/downloads.js';
 import { createDownloadService } from './download/service.js';
 import { createCreatorImportService } from './import/creator.js';
+import { LiveMonitor } from './live/monitor.js';
+import { sendLiveStarted, sendLiveArchived } from './live/discord-notifier.js';
 
 export async function deliverMonitorAlerts(targets, deliver, {
   videoId = 'unknown',
@@ -262,13 +264,101 @@ if (process.env.NODE_ENV !== 'test') {
     },
   });
 
+  // LIVE recording is optional and independent of normal post monitoring.
+  const liveTargets = (username) => {
+    if (config.discordLiveChannelId) {
+      return [{ channel_id: config.discordLiveChannelId }];
+    }
+
+    const subscriptions = (
+      store.listWatchSubscriptions?.(username, 'tiktok') ?? []
+    ).filter((subscription) =>
+      (subscription.platform ?? 'tiktok') === 'tiktok');
+
+    if (subscriptions.length) return subscriptions;
+
+    const channelId =
+      store.getWatch(username, 'tiktok')?.channel_id ||
+      config.discordChannelId;
+
+    return channelId ? [{ channel_id: channelId }] : [];
+  };
+
+  const liveWorker = config.liveEnabled ? new LiveMonitor({
+    store,
+    config,
+
+    onStart: async (session) => {
+      const targets = liveTargets(session.username);
+
+      const results = await Promise.allSettled(
+        targets.map((target) => sendLiveStarted({
+          client: discordClient,
+          channelId: target.channel_id,
+          session,
+        })),
+      );
+
+      for (const result of results) {
+        if (result.status === 'rejected') {
+          console.warn(
+            `[live] Start alert failed: ${result.reason?.message ?? result.reason}`,
+          );
+        }
+      }
+    },
+
+    onComplete: async (session) => {
+      const targets = liveTargets(session.username);
+
+      await deliverMonitorAlerts(
+        targets,
+        async (target) => {
+          const scope = await resolveMonitorDeliveryScope(
+            discordClient,
+            target,
+          );
+
+          const delivered = await downloadService.createDeliveryForAsset({
+            platform: 'tiktok',
+            fileId: session.fileId,
+            videoId: session.archiveId,
+            username: session.username,
+            sourceUrl: session.sourceUrl,
+            title: session.title ||
+              `LIVE recording by @${session.username}`,
+          }, {
+            type: 'monitor',
+            guildId: scope.guildId,
+            channelId: scope.channelId,
+            scopeId: scope.scopeId,
+            permanent: true,
+          });
+
+          await sendLiveArchived({
+            client: discordClient,
+            channelId: scope.channelId,
+            session,
+            publicUrl: delivered.publicUrl,
+          });
+        },
+        {
+          videoId: session.archiveId,
+          eventType: 'live_archived',
+          store,
+        },
+      );
+    },
+  }) : null;
   const httpService = await startHttpServer({ config, store, monitor, creatorImportService });
   discordClient = await startDiscordBot({ config, store, monitor, downloadOne, downloadService, registerCommands });
+  await liveWorker?.start();
 
   async function shutdown(signal) {
     console.log(`[shutdown] Received ${signal}`);
     monitor.stop();
     clearInterval(cleanupTimer);
+    await liveWorker?.stop();
     const importDrain = creatorImportService.stop?.({ drain: true });
     await discordClient?.destroy?.();
     await new Promise((resolve) => httpService.server.close(resolve));
