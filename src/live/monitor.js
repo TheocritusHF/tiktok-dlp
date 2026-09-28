@@ -1,6 +1,7 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { copyFile, mkdir, readFile, readdir, rename, rm, stat, statfs, writeFile, chmod } from 'node:fs/promises';
 import path from 'node:path';
+import { discoverLiveFormats, qualityImproves } from './adaptive-quality.js';
 import {
   captureTikTokLive, inspectRecordedMedia, largestRecordedFile, liveUrl,
   probeTikTokLive, remuxRecordedMedia,
@@ -26,12 +27,15 @@ async function hasFreeDisk(dir, requiredGb) {
 export class LiveMonitor {
   constructor({ store, config, probe = probeTikTokLive, capture = captureTikTokLive,
     remux = remuxRecordedMedia, inspect = inspectRecordedMedia,
+    discover = discoverLiveFormats,
+    qualityStartDelayMs = 20_000, qualityPollMs = 2_000,
+    qualitySampleMs = null, qualityStableMs = 5_000,
     onStart = null, onComplete = null, logger = console, now = () => Date.now(),
   } = {}) {
     if (!store?.listWatches || !store?.createFileWithMedia || !config?.downloadDir || !config?.dataDir) {
       throw new Error('LiveMonitor requires the existing archive store and download/data directories.');
     }
-    Object.assign(this, { store, config, probe, capture, remux, inspect, onStart, onComplete, logger, now });
+    Object.assign(this, { store, config, probe, capture, remux, inspect, discover, onStart, onComplete, logger, now });
     this.root = path.join(config.dataDir, 'live');
     this.sessionDir = path.join(this.root, 'sessions');
     this.stageRoot = path.join(this.root, 'staging');
@@ -49,6 +53,10 @@ export class LiveMonitor {
     this.inFlight = null;
     this.cookieCopy = '';
     this.runtimeConfig = null;
+    this.qualityStartDelayMs = qualityStartDelayMs;
+    this.qualityPollMs = qualityPollMs;
+    this.qualitySampleMs = qualitySampleMs;
+    this.qualityStableMs = qualityStableMs;
   }
 
   async start() {
@@ -88,11 +96,17 @@ export class LiveMonitor {
     this.running = false;
     clearInterval(this.timer);
     this.timer = null;
-    for (const entry of this.active.values()) entry.handle?.stop();
+    for (const entry of this.active.values()) {
+      clearInterval(entry.qualityTimer);
+      clearTimeout(entry.qualityDelay);
+      entry.trial?.handle?.stop();
+      (entry.current?.handle ?? entry.handle)?.stop();
+    }
     // Do not remux multi-hour recordings inside Docker's shutdown grace period.
     // If remuxing a long recording is already in progress, leave its session journal
     // at 'finalizing' and finish it on the next startup rather than blocking SIGTERM.
-    const tasks = [...this.active.values()].map((entry) => entry.completion ?? entry.handle?.done);
+    const tasks = [...this.active.values()].flatMap((entry) =>
+      [entry.completion ?? entry.handle?.done, entry.qualityTask].filter(Boolean));
     let deadline;
     try {
       await Promise.race([
@@ -177,26 +191,45 @@ export class LiveMonitor {
       stagingDir, sourceUrl: liveUrl(username),
       phase: 'recording', fileId: null, partial: false, announcedStart: false,
     };
+    const adaptive = this.config.liveAdaptiveQualityEnabled === true;
+    if (adaptive) session.segments = [];
     await this.#writeSession(session);
-    const entry = { session, handle: null, startedNotification: null, diskTimer: null, maxTimer: null };
+    const entry = {
+      session, handle: null, current: null, trial: null,
+      startedNotification: null, diskTimer: null, maxTimer: null,
+      qualityTimer: null, qualityDelay: null, qualityTask: null,
+      qualityFailures: new Map(),
+    };
     this.active.set(username.toLowerCase(), entry);
     try {
-      entry.handle = this.capture(session, this.runtimeConfig, {
-        logger: this.logger,
-        onFirstData: () => {
-          if (session.announcedStart) return;
-          session.announcedStart = true;
-          entry.startedNotification = Promise.resolve(this.onStart?.({ ...session }))
-            .catch((error) => this.logger.warn?.(`[live] Recording started but start alert failed for @${username}: ${error.message}`));
-        },
-      });
+      if (adaptive) {
+        // Start recording immediately. Quality discovery happens separately,
+        // so a slow quality check cannot delay the initial capture.
+        await this.#beginSegment(
+          entry, 'flv-hd/flv-hd1/rtmp-pull/hls-hd/hls-pull/best',
+        );
+        const intervalMs =
+          Math.max(5, Number(this.config.liveQualityCheckMinutes || 15)) * 60_000;
+        entry.qualityTimer = setInterval(
+          () => this.#startQualityCheck(entry),
+          intervalMs,
+        );
+        entry.qualityTimer.unref?.();
+      } else {
+        // Preserve PR 1's original single-file recording behavior.
+        entry.handle = this.capture(session, this.runtimeConfig, {
+          logger: this.logger,
+          onFirstData: () => this.#notifyStarted(entry),
+        });
+      }
       entry.diskTimer = setInterval(() => {
         void hasFreeDisk(this.config.downloadDir, this.config.liveMinFreeGb ?? 10)
           .then((okay) => {
             if (!okay && !this.stopping) {
               session.stopReason = 'low_disk';
               this.logger.warn?.(`[live] Low disk space; stopping @${username}'s recording without deleting the captured bytes.`);
-              entry.handle?.stop();
+              entry.trial?.handle?.stop();
+              (entry.current?.handle ?? entry.handle)?.stop();
             }
           }).catch((error) => this.logger.warn?.(`[live] Disk check failed: ${error.message}`));
       }, 60_000);
@@ -205,7 +238,8 @@ export class LiveMonitor {
       if (maxHours > 0) {
         entry.maxTimer = setTimeout(() => {
           session.stopReason = 'segment_limit';
-          entry.handle?.stop();
+          entry.trial?.handle?.stop();
+          (entry.current?.handle ?? entry.handle)?.stop();
         }, maxHours * 3_600_000);
         entry.maxTimer.unref?.();
       }
@@ -222,32 +256,404 @@ export class LiveMonitor {
     }
   }
 
-  async #captureFinished(entry) {
-    const { session, handle } = entry;
+  #notifyStarted(entry) {
+    const { session } = entry;
+    if (session.announcedStart) return;
+    session.announcedStart = true;
+    entry.startedNotification = Promise.resolve(this.onStart?.({ ...session }))
+      .catch((error) => this.logger.warn?.(
+        `[live] Recording started but start alert failed for @${session.username}: ${error.message}`,
+      ));
+    void this.#writeSession(session).catch((error) =>
+      this.logger.warn?.(`[live] Could not journal start notification: ${error.message}`));
+    if (session.segments && !entry.qualityDelay) {
+      entry.qualityDelay = setTimeout(
+        () => this.#startQualityCheck(entry),
+        this.qualityStartDelayMs,
+      );
+      entry.qualityDelay.unref?.();
+    }
+  }
+
+  async #beginSegment(entry, format, { testing = false } = {}) {
+    if (this.stopping || entry.session.stopReason) {
+      throw new Error('LIVE recorder is stopping.');
+    }
+
+    const { session } = entry;
+    const index = session.segments.length;
+    const stagingDir = path.join(
+      session.stagingDir, 'segments', String(index).padStart(3, '0'),
+    );
+
+    await mkdir(stagingDir, { recursive: true });
+
+    const segment = {
+      index,
+      format,
+      startedAt: this.now(),
+      status: testing ? 'testing' : 'accepted',
+    };
+
+    session.segments.push(segment);
+
+    // Persist the segment before starting its recorder for crash recovery.
+    await this.#writeSession(session);
+
+    if (this.stopping || session.stopReason) {
+      throw new Error('LIVE recorder is stopping.');
+    }
+
+    const handle = this.capture(
+      { ...session, stagingDir },
+      this.runtimeConfig,
+      {
+        format,
+        logger: this.logger,
+        onFirstData: () => {
+          if (!testing) this.#notifyStarted(entry);
+        },
+      },
+    );
+
+    const result = { handle, segment, stagingDir };
+
+    // Register the recorder immediately so shutdown can stop it.
+    if (testing) {
+      entry.trial = result;
+    } else {
+      entry.current = result;
+      entry.handle = handle;
+    }
+
+    if (this.stopping || session.stopReason) {
+      handle.stop();
+    }
+
+    return result;
+  }
+  #startQualityCheck(entry) {
+    if (this.stopping || !this.running || entry.session.stopReason
+      || !entry.current || entry.qualityTask
+      || !this.active.has(entry.session.username.toLowerCase())) return;
+
+    const task = this.#checkQuality(entry)
+      .catch((error) => this.logger.warn?.(
+        `[live] @${entry.session.username}: quality check skipped: ${error.message}`,
+      ))
+      .finally(() => {
+        if (entry.qualityTask === task) entry.qualityTask = null;
+      });
+
+    entry.qualityTask = task;
+  }
+
+  async #checkQuality(entry) {
+    if (!await hasFreeDisk(
+      this.config.downloadDir,
+      this.config.liveMinFreeGb ?? 10,
+    )) return;
+
+    if (!await hasFreeDisk(
+      this.config.dataDir,
+      this.config.liveMinFreeGb ?? 10,
+    )) return;
+
+    const baseline = await largestRecordedFile(entry.current.stagingDir);
+    if (!baseline || baseline.bytes < 512 * 1024) return;
+
+    // TikTok's advertised dimensions are not trusted as proof of quality.
+    // Measure the bytes that are actually being recorded.
+    let currentQuality;
     try {
-      const exit = await handle.done;
+      currentQuality = await this.inspect(baseline.path);
+    } catch {
+      // The ongoing stream may still have an incomplete container header.
+      return;
+    }
+
+    const candidates = await this.discover(
+      entry.session.username,
+      this.runtimeConfig,
+    );
+
+    if (!Array.isArray(candidates)) return;
+
+    let attempts = 0;
+
+    for (const candidate of candidates) {
+      if (this.stopping || entry.session.stopReason || !this.running
+        || !entry.current) return;
+
+      // Bound extra bandwidth, disk usage and TikTok requests per check.
+      if (attempts >= 2) break;
+
+      if (candidate.id === entry.current.segment.format) continue;
+
+      if (entry.current.segment.format.includes('/')
+        && candidate.id === entry.current.segment.format.split('/')[0]) {
+        continue;
+      }
+
+      if ((entry.qualityFailures.get(candidate.id) ?? 0) > this.now()) {
+        continue;
+      }
+
+      // Unknown resolutions are worth sampling. Known inferior formats are not.
+      const candidatePixels =
+        Number(candidate.width) * Number(candidate.height);
+      const currentPixels =
+        Number(currentQuality.width) * Number(currentQuality.height);
+
+      if (candidatePixels > 0
+        && candidatePixels < currentPixels * 0.99) {
+        continue;
+      }
+
+      if (!await hasFreeDisk(
+        this.config.downloadDir,
+        this.config.liveMinFreeGb ?? 10,
+      )) return;
+
+      if (!await hasFreeDisk(
+        this.config.dataDir,
+        this.config.liveMinFreeGb ?? 10,
+      )) return;
+
+      if (this.stopping || entry.session.stopReason || !this.running) return;
+
+      attempts++;
+
+      let trial;
+
+      try {
+        trial = await this.#beginSegment(
+          entry,
+          candidate.id,
+          { testing: true },
+        );
+
+        const cutoff = Date.now() + (
+          this.qualitySampleMs ??
+          Math.max(
+            10,
+            Number(this.config.liveQualitySampleSeconds || 20),
+          ) * 1_000
+        );
+
+        let trialExited = false;
+
+        void trial.handle.done.then(() => {
+          trialExited = true;
+        });
+
+        let measured = null;
+        let verifiedAt = 0;
+        let initialBytes = 0;
+
+        while (Date.now() < cutoff
+          && !this.stopping
+          && !entry.session.stopReason) {
+          await new Promise((resolve) =>
+            setTimeout(resolve, this.qualityPollMs));
+
+          const file = await largestRecordedFile(trial.stagingDir);
+
+          if (!file || file.bytes < 512 * 1024) {
+            if (trialExited) break;
+            continue;
+          }
+
+          if (!verifiedAt) {
+            try {
+              measured = await this.inspect(file.path);
+            } catch {
+              // Retry while the candidate stream is still writing.
+            }
+
+            if (measured?.width > 0 && measured?.height > 0) {
+              verifiedAt = Date.now();
+              initialBytes = file.bytes;
+            }
+          } else if (
+            Date.now() - verifiedAt >= this.qualityStableMs
+            && file.bytes >= initialBytes + 64 * 1024
+          ) {
+            // Confirm that the candidate keeps delivering video.
+            break;
+          }
+
+          if (trialExited) break;
+        }
+
+        const finalFile =
+          await largestRecordedFile(trial.stagingDir);
+
+        const stable =
+          verifiedAt
+          && Date.now() - verifiedAt >= this.qualityStableMs
+          && finalFile?.bytes >= initialBytes + 64 * 1024
+          && !trialExited;
+
+        if (stable
+          && measured
+          && qualityImproves(measured, currentQuality)
+          && !this.stopping
+          && !entry.session.stopReason) {
+          const previous = entry.current;
+
+          trial.segment.status = 'accepted';
+          trial.segment.actualQuality = measured;
+
+          // Recovery must know the new segment is accepted BEFORE
+          // the existing working recorder is stopped.
+          await this.#writeSession(entry.session);
+
+          entry.current = trial;
+          entry.handle = trial.handle;
+          entry.trial = null;
+
+          previous.handle.stop();
+
+          this.logger.info?.(
+            `[live] QUALITY UPGRADE @${entry.session.username}: `
+            + `${currentQuality.width}x${currentQuality.height} -> `
+            + `${measured.width}x${measured.height} (${candidate.id}).`,
+          );
+
+          return;
+        }
+
+        // A failed candidate must never replace or interrupt the
+        // existing working recorder.
+        entry.qualityFailures.set(
+          candidate.id,
+          this.now() + 60 * 60_000,
+        );
+
+        trial.segment.status = 'rejected';
+        await this.#writeSession(entry.session);
+      } catch (error) {
+        entry.qualityFailures.set(
+          candidate.id,
+          this.now() + 60 * 60_000,
+        );
+
+        if (trial) {
+          // Unexpected failures retain the journal entry and bytes
+          // so startup recovery can make the safe decision later.
+          trial.segment.status = 'testing';
+          await this.#writeSession(entry.session).catch(() => {});
+        }
+
+        this.logger.warn?.(
+          `[live] @${entry.session.username}: `
+          + `${candidate.id} test failed: ${error.message}`,
+        );
+      } finally {
+        if (trial && entry.current !== trial) {
+          trial.handle.stop();
+          await trial.handle.done;
+
+          if (trial.segment.status === 'rejected') {
+            await rm(
+              trial.stagingDir,
+              { recursive: true, force: true },
+            );
+          }
+
+          if (entry.trial === trial) entry.trial = null;
+        }
+      }
+    }
+  }
+  async #captureFinished(entry) {
+    const { session } = entry;
+
+    try {
+      let exit;
+
+      if (entry.current) {
+        // Stopping an older segment after a quality switch must never
+        // finalize the whole LIVE. Always follow the currently accepted
+        // recorder until the actual active capture finishes.
+        let current = entry.current;
+
+        while (current) {
+          exit = await current.handle.done;
+
+          current.segment.finishedAt = this.now();
+          current.segment.exitCode = exit.code;
+
+          await this.#writeSession(session);
+
+          if (entry.current !== current) {
+            current = entry.current;
+            continue;
+          }
+
+          // A candidate may be completing its verification at exactly the
+          // same time as the current recorder exits. Let that decision finish
+          // before deciding whether the LIVE itself is finished.
+          if (entry.qualityTask) {
+            await entry.qualityTask;
+          }
+
+          if (entry.current !== current) {
+            current = entry.current;
+            continue;
+          }
+
+          break;
+        }
+      } else {
+        // Non-adaptive LIVE recording keeps PR 1's original behavior.
+        exit = await entry.handle.done;
+      }
+
       clearInterval(entry.diskTimer);
       clearTimeout(entry.maxTimer);
+      clearInterval(entry.qualityTimer);
+      clearTimeout(entry.qualityDelay);
+
       await entry.startedNotification;
-      if (this.stopping) return; // On next startup the recovery pass finalizes the partial capture.
-      session.partial = exit.code !== 0 || Boolean(session.stopReason);
+
+      if (this.stopping) {
+        // Startup recovery will archive the captured bytes.
+        return;
+      }
+
+      session.partial =
+        exit?.code !== 0 || Boolean(session.stopReason);
+
       await this.#finalize(session);
     } catch (error) {
-      // A remux or DB failure must remain recoverable on the next startup.
-      session.phase = session.phase === 'finalizing' ? 'finalizing' : 'failed';
+      // A remux or database failure must stay recoverable on startup.
+      session.phase =
+        session.phase === 'finalizing' ? 'finalizing' : 'failed';
+
       session.error = String(error.message).slice(0, 400);
+
       await this.#writeSession(session).catch(() => {});
-      this.logger.error?.(`[live] @${session.username}: recording could not be archived: ${error.message}. Source kept in ${session.stagingDir}`);
+
+      this.logger.error?.(
+        `[live] @${session.username}: recording could not be archived: `
+        + `${error.message}. Source kept in ${session.stagingDir}`,
+      );
     } finally {
       this.active.delete(session.username.toLowerCase());
+
       clearInterval(entry.diskTimer);
       clearTimeout(entry.maxTimer);
+      clearInterval(entry.qualityTimer);
+      clearTimeout(entry.qualityDelay);
     }
   }
 
   async #finalize(session) {
     if (session.phase === 'complete') return;
     if (session.phase === 'archived') return this.#notifyComplete(session);
+    if (Array.isArray(session.segments)) return this.#finalizeSegments(session);
     session.phase = 'finalizing';
     await this.#writeSession(session);
     const folder = path.join(this.config.downloadDir, 'lives', session.username,
@@ -337,6 +743,134 @@ export class LiveMonitor {
     await this.#notifyComplete(session);
   }
 
+  /** Independently archive every accepted segment. Do not use largest-file-wins for upgrades. */
+  async #finalizeSegments(session) {
+    session.phase = 'finalizing';
+    await this.#writeSession(session);
+    const folder = path.join(this.config.downloadDir, 'lives', session.username,
+      new Date(session.startedAt).toISOString().slice(0, 10));
+    await mkdir(folder, { recursive: true });
+    const basename = `${session.roomId}_${session.startedAt}`;
+    const segments = session.segments.filter((item) => item.status === 'accepted' || item.status === 'testing')
+      .sort((a, b) => a.index - b.index);
+    const archived = [];
+    let missing = false;
+    for (const segment of segments) {
+      const partNumber = segment.index + 1;
+      const basePath = path.join(folder, partNumber === 1 ? basename
+        : `${basename}_part${String(partNumber).padStart(2, '0')}`);
+      const archiveId = partNumber === 1 ? session.archiveId : `${session.archiveId}_part${String(partNumber).padStart(2, '0')}`;
+      const existing = this.store.getLatestFileByPost?.('tiktok', archiveId);
+      let dest = existing?.path;
+      let media;
+      let fileId = existing?.id;
+      const stage = path.join(session.stagingDir, 'segments', String(segment.index).padStart(3, '0'));
+      if (dest) {
+        if (!(await stat(dest).catch(() => null))?.isFile()) {
+          throw new Error(`The database references a missing LIVE segment: ${dest}`);
+        }
+        media = await this.inspect(dest);
+      } else {
+        // Atomic rename may have succeeded immediately before a crash, before the DB commit.
+        for (const ext of ['mp4', 'mkv', 'flv', 'ts', 'webm']) {
+          const candidate = `${basePath}.${ext}`;
+          if ((await stat(candidate).catch(() => null))?.isFile()) { dest = candidate; break; }
+        }
+        if (dest) {
+          media = await this.inspect(dest);
+        } else {
+          const source = await largestRecordedFile(stage);
+          if (!source || source.bytes < 64 * 1024) {
+            missing = true;
+            this.logger.warn?.(`[live] @${session.username}: segment ${partNumber} has no usable bytes; preserving session state.`);
+            continue;
+          }
+          try {
+            const remuxed = await this.remux(source.path, basePath, { inspect: this.inspect });
+            if (this.stopping) return;
+            dest = `${basePath}.${remuxed.ext}`;
+            await rename(remuxed.tempPath, dest);
+            media = await this.inspect(dest);
+          } catch (error) {
+            missing = true;
+            this.logger.warn?.(`[live] @${session.username}: segment ${partNumber} could not be converted: ${error.message}`);
+            continue; // Never discard another segment because one is damaged.
+          }
+        }
+        const fileStat = await stat(dest);
+        if (this.stopping) return;
+        const file = {
+          platform: 'tiktok', videoId: archiveId, username: session.username,
+          sourceUrl: session.sourceUrl, filePath: dest, filename: path.basename(dest),
+          sizeBytes: fileStat.size,
+        };
+        const data = {
+          platform: 'tiktok', remoteId: archiveId,
+          canonicalUrl: session.sourceUrl, sourceUrl: session.sourceUrl,
+          creatorHandle: session.username,
+          title: session.title || `LIVE recording by @${session.username}`,
+          mediaType: 'live', publishedAt: session.startedAt,
+          durationSeconds: media.duration,
+          metadata: { liveRoomId: session.roomId, startedAt: session.startedAt,
+            partial: session.partial, stopReason: session.stopReason ?? '',
+            recordingPart: partNumber, originalArchiveId: session.archiveId,
+            selectedFormat: segment.format, actualQuality: segment.actualQuality ?? null },
+          filePath: dest, filename: path.basename(dest), sizeBytes: fileStat.size,
+          assets: [{ path: dest, filename: path.basename(dest), sizeBytes: fileStat.size,
+            kind: 'video', mimeType: path.extname(dest) === '.mp4' ? 'video/mp4'
+              : path.extname(dest) === '.mkv' ? 'video/x-matroska'
+                : path.extname(dest) === '.ts' ? 'video/mp2t' : 'video/x-flv',
+            width: media.width, height: media.height, durationSeconds: media.duration }],
+        };
+        ({ fileId } = this.store.createFileWithMedia({ file, media: data }, this.now()));
+      }
+      const archiveScope = `live:archive:${archiveId}`;
+      if (typeof this.store.createLinkToken === 'function'
+        && !this.store.getPermanentMonitorDeliveryForFile?.(fileId, { scopeId: archiveScope })) {
+        this.store.createLinkToken({
+          token: randomBytes(24).toString('hex'), fileId, scopeId: archiveScope,
+          deliveryType: 'monitor', expiresAt: 0,
+        }, this.now());
+      }
+      const fileStat = await stat(dest);
+      archived.push({ index: segment.index, path: dest, fileId, archiveId,
+        sizeBytes: fileStat.size, durationSeconds: media.duration,
+        width: media.width, height: media.height });
+      segment.archivePath = dest;
+      segment.fileId = fileId;
+      await this.#writeSession(session); // Save per-segment progress for crash-safe retry.
+    }
+    if (!archived.length) throw new Error('No recoverable recording was found (no segment had verified video).');
+    const primary = archived[0];
+    session.fileId = primary.fileId;
+    session.primaryArchiveId = primary.archiveId;
+    session.archivePath = primary.path;
+    session.additionalArchives = archived.slice(1);
+    session.sizeBytes = archived.reduce((total, part) => total + part.sizeBytes, 0);
+    session.durationSeconds = archived.every((part) => Number.isFinite(part.durationSeconds))
+      ? archived.reduce((total, part) => total + part.durationSeconds, 0) : null;
+    session.partial = Boolean(session.partial || missing);
+    const approvedPartialFinalization =
+      Number.isSafeInteger(session.partialFinalizeRequestedAt)
+      && session.partialFinalizeRequestedAt >= session.startedAt
+      && session.partialFinalizeRequestedAt <= this.now();
+    if (missing && !approvedPartialFinalization) {
+      // Keep the session retryable until all accepted parts are archived.
+      session.phase = 'finalizing';
+      await this.#writeSession(session);
+      this.logger.warn?.('[live] Some recording segments remain unarchived; retaining staging data for recovery.');
+      return;
+    }
+    session.phase = 'archived';
+    await this.#writeSession(session);
+    // If any candidate failed verification, retain its staging bytes for manual recovery.
+    if (!missing) await rm(session.stagingDir, { recursive: true, force: true });
+    this.logger.info?.(`[live] ARCHIVED @${session.username} room ${session.roomId}: `
+      + `${archived.length} segment(s), ${session.sizeBytes} bytes${missing ? ' (some raw segments retained)' : ''}.`);
+    await this.#notifyComplete(session);
+  }
+
+
   async #notifyComplete(session) {
     if (this.stopping) return;
     try {
@@ -368,12 +902,14 @@ export class LiveMonitor {
       if (!this.running || this.stopping) return;
       const age = this.now() - Number(session.startedAt);
       if (age < 0 || age > MAX_SESSION_AGE_MS) continue;
-      if (['recording', 'finalizing'].includes(session.phase)) {
+      if (['recording', 'finalizing', 'failed'].includes(session.phase)) {
         try {
           session.partial = true;
           await this.#finalize(session);
         } catch (error) {
-          session.phase = 'failed';
+          // Keep segmented sessions retryable after a transient DB/remux failure.
+          // All accepted raw segments or already moved output files remain on disk.
+          session.phase = Array.isArray(session.segments) ? 'finalizing' : 'failed';
           session.error = `Recovery failed: ${String(error.message).slice(0, 320)}`;
           await this.#writeSession(session);
           this.logger.warn?.(`[live] Could not recover @${session.username}: ${error.message}`);

@@ -653,6 +653,41 @@ After changing `.env`, recreate the bot container to apply the settings:
 docker compose up -d --build tiktok-discord-downloader
 ```
 
+### Adaptive LIVE quality (optional)
+
+Adaptive quality is disabled by default. To enable it for the watched accounts
+whose LIVE recording is already enabled, add these settings to `.env`:
+
+```dotenv
+LIVE_ADAPTIVE_QUALITY_ENABLED=true
+LIVE_QUALITY_CHECK_MINUTES=15
+LIVE_QUALITY_SAMPLE_SECONDS=20
+```
+
+Recreate the bot container after changing these settings. The example Compose
+service forwards all three variables. The check interval has a minimum of
+5 minutes; the trial length is limited to 10-45 seconds. Setting
+`LIVE_ADAPTIVE_QUALITY_ENABLED=false` preserves the original single-file
+recording behavior.
+
+Recording starts immediately with a preferred LIVE format and a fallback.
+About 20 seconds after the first recorded data, the worker checks for other
+formats and then checks again every 15 minutes by default. It tests at most
+two alternatives per check while the original recording continues. A switch
+requires FFprobe to confirm an improvement in the recorded video and the
+candidate to keep growing for at least five seconds. Failed format IDs are
+skipped for an hour. Trials use extra bandwidth, disk space, and TikTok
+requests; checks are skipped when available disk space is too low.
+
+When a better stream is accepted, the old and new recordings are saved as
+separate, ordered archive parts. The Discord completion notification links to
+each part. The session journal supports recovery of interrupted parts on the
+next start; unarchived accepted parts stay available for retry. A switch may
+cause a short overlap or gap, so the total displayed duration can count an
+overlap twice. Parts with differing quality are not automatically stitched.
+The feature selects the best quality it can verify and access, without a
+guarantee that TikTok offers every possible rendition.
+
 ### Recording and recovery
 
 A recording begins when yt-dlp detects an active LIVE. The bot sends a
@@ -671,6 +706,4 @@ startup attempts to recover and archive the captured footage.
 recording. `LIVE_MAX_HOURS` limits each recording session's length; an
 ongoing broadcast can be detected again on a subsequent poll.
 
-This initial implementation uses yt-dlp for LIVE detection and capture.
-Adaptive quality selection and alternative webcast detection are not
-included in this feature.
+LIVE detection and capture use yt-dlp.

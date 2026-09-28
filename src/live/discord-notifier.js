@@ -29,7 +29,7 @@ export async function sendLiveStarted({ client, channelId, session }) {
   return send(client, channelId, lines.join('\n'));
 }
 
-export async function sendLiveArchived({ client, channelId, session, publicUrl }) {
+export async function sendLiveArchived({ client, channelId, session, publicUrl, additionalUrls = [] }) {
   const size = Number(session.sizeBytes);
   const lines = [
     '📼 **TikTok LIVE archived**',
@@ -38,7 +38,21 @@ export async function sendLiveArchived({ client, channelId, session, publicUrl }
     ...(Number.isFinite(size) && size > 0 ? [`Size: ${(size / 1024 ** 2).toFixed(1)} MB`] : []),
     ...(session.partial ? ['⚠️ Partial recording: the source ended unexpectedly, recording was interrupted, or a segment limit was reached.'] : []),
     ...(publicUrl ? [`Archive: ${publicUrl}`] : []),
+    ...additionalUrls.filter(Boolean).map((url, index) => `Recording part ${index + 2}: ${url}`),
+    ...(additionalUrls.length ? ['Quality switches are archived in separate parts, in chronological order.'] : []),
     `LIVE page: ${session.sourceUrl}`,
   ];
-  return send(client, channelId, lines.join('\n'));
+  // Discord enforces a 2,000-character limit; very long quality-switching LIVEs
+  // may produce several independently archived segments and links.
+  let chunk = '';
+  for (const line of lines) {
+    if (chunk && chunk.length + line.length + 1 > 1_800) {
+      await send(client, channelId, chunk);
+      chunk = '';
+    }
+    if (line.length > 1_800) throw new Error('A LIVE archive URL exceeds the Discord message limit.');
+    chunk = chunk ? `${chunk}\n${line}` : line;
+  }
+  if (chunk) await send(client, channelId, chunk);
+  return true;
 }

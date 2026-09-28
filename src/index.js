@@ -322,7 +322,7 @@ if (process.env.NODE_ENV !== 'test') {
           const delivered = await downloadService.createDeliveryForAsset({
             platform: 'tiktok',
             fileId: session.fileId,
-            videoId: session.archiveId,
+            videoId: session.primaryArchiveId ?? session.archiveId,
             username: session.username,
             sourceUrl: session.sourceUrl,
             title: session.title ||
@@ -335,11 +335,34 @@ if (process.env.NODE_ENV !== 'test') {
             permanent: true,
           });
 
+          const additionalUrls = [];
+
+          for (const part of session.additionalArchives ?? []) {
+            const extra = await downloadService.createDeliveryForAsset({
+              platform: 'tiktok',
+              fileId: part.fileId,
+              videoId: part.archiveId,
+              username: session.username,
+              sourceUrl: session.sourceUrl,
+              title: session.title ||
+                `LIVE recording by @${session.username}`,
+            }, {
+              type: 'monitor',
+              guildId: scope.guildId,
+              channelId: scope.channelId,
+              scopeId: scope.scopeId,
+              permanent: true,
+            });
+
+            additionalUrls.push(extra.publicUrl);
+          }
+
           await sendLiveArchived({
             client: discordClient,
             channelId: scope.channelId,
             session,
             publicUrl: delivered.publicUrl,
+            additionalUrls,
           });
         },
         {

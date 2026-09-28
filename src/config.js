@@ -118,6 +118,9 @@ export function loadConfig(env = process.env, cwd = process.cwd()) {
     liveProbeTimeoutMs: parsePositiveInt(env.LIVE_PROBE_TIMEOUT_SECONDS, 35) * 1000,
     liveMinFreeGb: parseNonNegativeInt(env.LIVE_MIN_FREE_GB, 10),
     liveMaxHours: parseNonNegativeInt(env.LIVE_MAX_HOURS, 8),
+    liveAdaptiveQualityEnabled: parseBoolean(env.LIVE_ADAPTIVE_QUALITY_ENABLED, false),
+    liveQualityCheckMinutes: Math.max(5, parsePositiveInt(env.LIVE_QUALITY_CHECK_MINUTES, 15)),
+    liveQualitySampleSeconds: Math.max(10, Math.min(45, parsePositiveInt(env.LIVE_QUALITY_SAMPLE_SECONDS, 20))),
     liveHandles: String(env.LIVE_RECORDING_HANDLES ?? '').split(',')
       .map((name) => name.trim().toLowerCase().replace(/^@/, ''))
       .filter((name) => /^[a-z0-9._]{1,32}$/.test(name) && !name.includes('..')),

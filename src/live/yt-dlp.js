@@ -66,9 +66,16 @@ export async function largestRecordedFile(dir) {
 }
 
 /** A child-process handle; preserves the source bytes even on non-zero yt-dlp exits. */
-export function captureTikTokLive(session, config, { onFirstData = () => {}, logger = console } = {}) {
+export function captureTikTokLive(session, config, { onFirstData = () => {}, logger = console, format = null } = {}) {
+  // Restrict custom selections to yt-dlp format IDs and fallback lists.
+  if (format !== null &&
+    (typeof format !== 'string' ||
+      !/^[a-z0-9][a-z0-9._-]*(?:\/[a-z0-9][a-z0-9._-]*)*$/i.test(format))) {
+    throw new Error('Invalid LIVE format selector.');
+  }
+  const selectedFormat = format ?? 'best[ext=flv]/best';
   const args = [...commonArgs(config), '--no-part', '--hls-use-mpegts',
-    '--format', 'best[ext=flv]/best',
+    '--format', selectedFormat,
     '--output', path.join(session.stagingDir, 'recording.%(ext)s'),
     '--', liveUrl(session.username)];
   const child = spawn(config.ytdlpPath || 'yt-dlp', args, {
@@ -123,7 +130,9 @@ export function captureTikTokLive(session, config, { onFirstData = () => {}, log
 
 export async function inspectRecordedMedia(filePath) {
   const { stdout } = await execFile('ffprobe', [
-    '-v', 'error', '-show_entries', 'stream=codec_type,width,height:format=duration',
+    '-v', 'error',
+    '-show_entries',
+    'stream=codec_type,width,height,avg_frame_rate,r_frame_rate,bit_rate:format=duration',
     '-of', 'json', filePath,
   ], { timeout: 30_000, maxBuffer: 1024 * 1024 });
   const data = JSON.parse(stdout);
@@ -131,9 +140,25 @@ export async function inspectRecordedMedia(filePath) {
   if (!video || Number(video.width) <= 0 || Number(video.height) <= 0) {
     throw new Error('Recording does not contain a verified video stream.');
   }
+
+  const parseFrameRate = (value) => {
+    const [numerator, denominator = '1'] = String(value ?? '').split('/');
+    const rate = Number(numerator) / Number(denominator);
+    return Number.isFinite(rate) && rate > 0 ? rate : 0;
+  };
+
+  const fps = parseFrameRate(video.avg_frame_rate)
+    || parseFrameRate(video.r_frame_rate);
+  const videoBitrate = Number(video.bit_rate);
+  const bitrate = Number.isFinite(videoBitrate) && videoBitrate > 0
+    ? videoBitrate : 0;
   const duration = Number(data.format?.duration);
+
   return {
-    width: Number(video.width), height: Number(video.height),
+    width: Number(video.width),
+    height: Number(video.height),
+    fps,
+    bitrate,
     duration: Number.isFinite(duration) && duration >= 0 ? duration : null,
   };
 }
