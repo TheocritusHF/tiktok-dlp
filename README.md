@@ -13,6 +13,14 @@ Cloudflare Access-protected archive.
 
 Implementation progress and remaining work are tracked in [WORKLOG.md](WORKLOG.md).
 
+> **Proposed from this fork:** [automatic LIVE recording](https://github.com/nqrwhal/tiktok-dlp/pull/23)
+> and [adaptive LIVE quality](https://github.com/nqrwhal/tiktok-dlp/pull/24)
+> are on [separate feature branches](FORK_ROADMAP.md), with both options
+> disabled by default. These proposals are not yet part of the default `main`
+> branch. The [fork roadmap](FORK_ROADMAP.md) explains the branches, settings,
+> and planned follow-ups; the PR pages show current review status.
+
+
 > [!IMPORTANT]
 > Optional, platform-specific Netscape cookies authenticate as a real account so
 > the bot can archive posts that account can already view. They
