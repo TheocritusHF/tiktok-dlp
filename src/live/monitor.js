@@ -6,6 +6,7 @@ import {
   captureTikTokLive, inspectRecordedMedia, largestRecordedFile, liveUrl,
   probeTikTokLive, remuxRecordedMedia,
 } from './yt-dlp.js';
+import { captureWebcastLive, probeWebcastLive } from './webcast.js';
 
 const POLL_MINIMUM_MS = 60_000;
 const START_RETRY_MS = 120_000;
@@ -26,6 +27,7 @@ async function hasFreeDisk(dir, requiredGb) {
 /** Separate, opt-in TikTok LIVE worker. Never modifies the post/story poller. */
 export class LiveMonitor {
   constructor({ store, config, probe = probeTikTokLive, capture = captureTikTokLive,
+    webcastProbe = probeWebcastLive, webcastCapture = captureWebcastLive,
     remux = remuxRecordedMedia, inspect = inspectRecordedMedia,
     discover = discoverLiveFormats,
     qualityStartDelayMs = 20_000, qualityPollMs = 2_000,
@@ -35,7 +37,8 @@ export class LiveMonitor {
     if (!store?.listWatches || !store?.createFileWithMedia || !config?.downloadDir || !config?.dataDir) {
       throw new Error('LiveMonitor requires the existing archive store and download/data directories.');
     }
-    Object.assign(this, { store, config, probe, capture, remux, inspect, discover, onStart, onComplete, logger, now });
+    Object.assign(this, { store, config, probe, capture, webcastProbe, webcastCapture,
+      remux, inspect, discover, onStart, onComplete, logger, now });
     this.root = path.join(config.dataDir, 'live');
     this.sessionDir = path.join(this.root, 'sessions');
     this.stageRoot = path.join(this.root, 'staging');
@@ -99,6 +102,7 @@ export class LiveMonitor {
     for (const entry of this.active.values()) {
       clearInterval(entry.qualityTimer);
       clearTimeout(entry.qualityDelay);
+      entry.cancelReconnectDelay?.();
       entry.trial?.handle?.stop();
       (entry.current?.handle ?? entry.handle)?.stop();
     }
@@ -107,6 +111,7 @@ export class LiveMonitor {
     // at 'finalizing' and finish it on the next startup rather than blocking SIGTERM.
     const tasks = [...this.active.values()].flatMap((entry) =>
       [entry.completion ?? entry.handle?.done, entry.qualityTask].filter(Boolean));
+    if (this.inFlight) tasks.push(this.inFlight);
     let deadline;
     try {
       await Promise.race([
@@ -116,7 +121,6 @@ export class LiveMonitor {
     } finally {
       clearTimeout(deadline);
     }
-    if (this.inFlight) await this.inFlight.catch(() => {});
     if (this.cookieCopy) await rm(this.cookieCopy, { force: true });
     this.cookieCopy = '';
   }
@@ -126,6 +130,12 @@ export class LiveMonitor {
     const task = this.#cycle().finally(() => { if (this.inFlight === task) this.inFlight = null; });
     this.inFlight = task;
     return task;
+  }
+
+  async #probeLive(username) {
+    const live = await this.probe(username, this.runtimeConfig);
+    if (live || !this.config.liveWebcastFallbackEnabled) return live;
+    return this.webcastProbe(username, this.runtimeConfig);
   }
 
   async #cycle() {
@@ -150,7 +160,7 @@ export class LiveMonitor {
         .filter((username) => !this.active.has(username.toLowerCase()));
       const detected = await Promise.all(batch.map(async (username) => {
         try {
-          return { username, live: await this.probe(username, this.runtimeConfig) };
+          return { username, live: await this.#probeLive(username) };
         } catch (error) {
           // A failed probe is NOT evidence the creator is offline.
           if (this.now() - (this.lastErrorAt.get(username.toLowerCase()) ?? 0) > 15 * 60_000) {
@@ -192,35 +202,46 @@ export class LiveMonitor {
       phase: 'recording', fileId: null, partial: false, announcedStart: false,
     };
     const adaptive = this.config.liveAdaptiveQualityEnabled === true;
-    if (adaptive) session.segments = [];
+    const segmented = adaptive || this.config.liveReconnectEnabled === true;
+    if (segmented) session.segments = [];
     await this.#writeSession(session);
     const entry = {
       session, handle: null, current: null, trial: null,
       startedNotification: null, diskTimer: null, maxTimer: null,
       qualityTimer: null, qualityDelay: null, qualityTask: null,
       qualityFailures: new Map(),
+      captureSource: live.source === 'webcast' ? 'webcast' : 'ytdlp',
+      streamUrl: live.source === 'webcast' ? live.streamUrl : '',
+      shortReconnects: 0, cancelReconnectDelay: null,
     };
     this.active.set(username.toLowerCase(), entry);
     try {
-      if (adaptive) {
+      if (this.stopping) throw new Error('LIVE recorder is stopping.');
+      if (segmented) {
         // Start recording immediately. Quality discovery happens separately,
         // so a slow quality check cannot delay the initial capture.
         await this.#beginSegment(
-          entry, 'flv-hd/flv-hd1/rtmp-pull/hls-hd/hls-pull/best',
+          entry, entry.captureSource === 'webcast'
+            ? 'webcast' : 'flv-hd/flv-hd1/rtmp-pull/hls-hd/hls-pull/best',
         );
-        const intervalMs =
-          Math.max(5, Number(this.config.liveQualityCheckMinutes || 15)) * 60_000;
-        entry.qualityTimer = setInterval(
-          () => this.#startQualityCheck(entry),
-          intervalMs,
-        );
-        entry.qualityTimer.unref?.();
+        if (adaptive) {
+          const intervalMs =
+            Math.max(5, Number(this.config.liveQualityCheckMinutes || 15)) * 60_000;
+          entry.qualityTimer = setInterval(
+            () => this.#startQualityCheck(entry),
+            intervalMs,
+          );
+          entry.qualityTimer.unref?.();
+        }
       } else {
         // Preserve PR 1's original single-file recording behavior.
-        entry.handle = this.capture(session, this.runtimeConfig, {
+        const capture = entry.captureSource === 'webcast' ? this.webcastCapture : this.capture;
+        entry.handle = capture(session, this.runtimeConfig, {
           logger: this.logger,
+          streamUrl: entry.streamUrl,
           onFirstData: () => this.#notifyStarted(entry),
         });
+        if (this.stopping) entry.handle.stop();
       }
       entry.diskTimer = setInterval(() => {
         void hasFreeDisk(this.config.downloadDir, this.config.liveMinFreeGb ?? 10)
@@ -266,7 +287,8 @@ export class LiveMonitor {
       ));
     void this.#writeSession(session).catch((error) =>
       this.logger.warn?.(`[live] Could not journal start notification: ${error.message}`));
-    if (session.segments && !entry.qualityDelay) {
+    if (this.config.liveAdaptiveQualityEnabled && entry.captureSource !== 'webcast'
+      && session.segments && !entry.qualityDelay) {
       entry.qualityDelay = setTimeout(
         () => this.#startQualityCheck(entry),
         this.qualityStartDelayMs,
@@ -304,11 +326,13 @@ export class LiveMonitor {
       throw new Error('LIVE recorder is stopping.');
     }
 
-    const handle = this.capture(
+    const capture = entry.captureSource === 'webcast' ? this.webcastCapture : this.capture;
+    const handle = capture(
       { ...session, stagingDir },
       this.runtimeConfig,
       {
         format,
+        streamUrl: entry.streamUrl,
         logger: this.logger,
         onFirstData: () => {
           if (!testing) this.#notifyStarted(entry);
@@ -334,6 +358,7 @@ export class LiveMonitor {
   }
   #startQualityCheck(entry) {
     if (this.stopping || !this.running || entry.session.stopReason
+      || entry.captureSource === 'webcast'
       || !entry.current || entry.qualityTask
       || !this.active.has(entry.session.username.toLowerCase())) return;
 
@@ -567,6 +592,81 @@ export class LiveMonitor {
       }
     }
   }
+
+  #reconnectDelay(entry) {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        entry.cancelReconnectDelay = null;
+        resolve(true);
+      }, Number(this.config.liveReconnectDelayMs ?? 2_000));
+      entry.cancelReconnectDelay = () => {
+        clearTimeout(timer);
+        entry.cancelReconnectDelay = null;
+        resolve(false);
+      };
+    });
+  }
+
+  async #tryReconnect(entry, exit, current) {
+    const { session } = entry;
+    if (!this.config.liveReconnectEnabled || exit?.code !== 0
+      || !this.running || this.stopping || session.stopReason) return false;
+
+    if (!await this.#reconnectDelay(entry) || this.stopping || !this.running) return false;
+
+    let live;
+    try {
+      live = await this.#probeLive(session.username);
+    } catch {
+      // Network/verification failures are not evidence that the creator went offline.
+      session.stopReason = 'reconnect_probe_failed';
+      return false;
+    }
+    if (!live || live.roomId !== session.roomId || this.stopping || !this.running) return false;
+
+    const stableMs = Number(this.config.liveReconnectStableMs ?? 60_000);
+    if (this.now() - current.segment.startedAt >= stableMs) entry.shortReconnects = 0;
+    if (entry.shortReconnects >= Number(this.config.liveReconnectMaxAttempts ?? 2)) {
+      session.stopReason = 'reconnect_limit';
+      return false;
+    }
+    try {
+      if (!await hasFreeDisk(this.config.downloadDir, this.config.liveMinFreeGb ?? 10)
+        || !await hasFreeDisk(this.config.dataDir, this.config.liveMinFreeGb ?? 10)) {
+        session.stopReason = 'low_disk';
+        return false;
+      }
+    } catch {
+      session.stopReason = 'reconnect_disk_check_failed';
+      return false;
+    }
+    if (this.stopping || !this.running) return false;
+
+    entry.captureSource = live.source === 'webcast' ? 'webcast' : 'ytdlp';
+    entry.streamUrl = live.source === 'webcast' ? live.streamUrl : '';
+    try {
+      const format = entry.captureSource === 'webcast' ? 'webcast'
+        : current.segment.format === 'webcast'
+          ? 'flv-hd/flv-hd1/rtmp-pull/hls-hd/hls-pull/best'
+          : current.segment.format;
+      await this.#beginSegment(entry, format);
+      entry.shortReconnects++;
+      this.logger.info?.('[live] Reconnected @' + session.username + ' to room ' + session.roomId + '.');
+      return true;
+    } catch {
+      // Preserve a partially created new part when its recorder already wrote bytes.
+      const last = session.segments.at(-1);
+      if (last && last.index > current.segment.index) {
+        const stage = path.join(session.stagingDir, 'segments', String(last.index).padStart(3, '0'));
+        const file = await largestRecordedFile(stage).catch(() => null);
+        if (!file || file.bytes < 64 * 1024) last.status = 'rejected';
+      }
+      session.stopReason = 'reconnect_start_failed';
+      await this.#writeSession(session).catch(() => {});
+      return false;
+    }
+  }
+
   async #captureFinished(entry) {
     const { session } = entry;
 
@@ -600,6 +700,11 @@ export class LiveMonitor {
           }
 
           if (entry.current !== current) {
+            current = entry.current;
+            continue;
+          }
+
+          if (await this.#tryReconnect(entry, exit, current)) {
             current = entry.current;
             continue;
           }

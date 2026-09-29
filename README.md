@@ -688,6 +688,35 @@ overlap twice. Parts with differing quality are not automatically stitched.
 The feature selects the best quality it can verify and access, without a
 guarantee that TikTok offers every possible rendition.
 
+### Webcast fallback and reconnects (optional)
+
+These settings apply only when automatic LIVE recording is enabled:
+
+~~~dotenv
+LIVE_WEBCAST_FALLBACK_ENABLED=true
+LIVE_RECONNECT_ENABLED=true
+LIVE_RECONNECT_DELAY_SECONDS=2
+LIVE_RECONNECT_MAX_ATTEMPTS=2
+LIVE_RECONNECT_STABLE_SECONDS=60
+~~~
+
+Both features are disabled by default. yt-dlp remains the primary LIVE
+detector and recorder. If it reports an account offline, the webcast fallback
+checks TikTok's public room data, verifies the requested creator and active
+room, and obtains a fresh HTTPS stream address. FFmpeg copies that stream
+into a recoverable Matroska recording. Signed stream addresses are kept in
+memory and excluded from journals and logs. If TikTok blocks the profile or
+returns incomplete room data, the fallback treats the result as inconclusive.
+
+After a recorder exits cleanly, reconnect checks the creator again after a
+short delay. It continues only while the same room is still LIVE. Two short
+reconnects are allowed by default; a segment lasting at least 60 seconds
+resets the short-reconnect count. Reaching the limit archives available parts
+as partial with the reason reconnect_limit. Network check failures also
+preserve available parts as partial. Reconnected footage is archived as
+separate parts, even when adaptive quality is off. Shutdown cancels pending
+reconnects and leaves interrupted bytes for startup recovery.
+
 ### Recording and recovery
 
 A recording begins when yt-dlp detects an active LIVE. The bot sends a
@@ -706,4 +735,4 @@ startup attempts to recover and archive the captured footage.
 recording. `LIVE_MAX_HOURS` limits each recording session's length; an
 ongoing broadcast can be detected again on a subsequent poll.
 
-LIVE detection and capture use yt-dlp.
+LIVE detection and capture use yt-dlp first.

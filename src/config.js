@@ -121,6 +121,11 @@ export function loadConfig(env = process.env, cwd = process.cwd()) {
     liveAdaptiveQualityEnabled: parseBoolean(env.LIVE_ADAPTIVE_QUALITY_ENABLED, false),
     liveQualityCheckMinutes: Math.max(5, parsePositiveInt(env.LIVE_QUALITY_CHECK_MINUTES, 15)),
     liveQualitySampleSeconds: Math.max(10, Math.min(45, parsePositiveInt(env.LIVE_QUALITY_SAMPLE_SECONDS, 20))),
+    liveWebcastFallbackEnabled: parseBoolean(env.LIVE_WEBCAST_FALLBACK_ENABLED, false),
+    liveReconnectEnabled: parseBoolean(env.LIVE_RECONNECT_ENABLED, false),
+    liveReconnectDelayMs: Math.max(1, Math.min(30, parsePositiveInt(env.LIVE_RECONNECT_DELAY_SECONDS, 2))) * 1000,
+    liveReconnectMaxAttempts: Math.min(5, parseNonNegativeInt(env.LIVE_RECONNECT_MAX_ATTEMPTS, 2)),
+    liveReconnectStableMs: Math.max(10, parsePositiveInt(env.LIVE_RECONNECT_STABLE_SECONDS, 60)) * 1000,
     liveHandles: String(env.LIVE_RECORDING_HANDLES ?? '').split(',')
       .map((name) => name.trim().toLowerCase().replace(/^@/, ''))
       .filter((name) => /^[a-z0-9._]{1,32}$/.test(name) && !name.includes('..')),
