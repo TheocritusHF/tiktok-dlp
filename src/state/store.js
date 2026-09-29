@@ -57,6 +57,11 @@ export class Store {
         name: 'highlight-check-schedule',
         up: () => this.migrateHighlightCheckSchedule(),
       },
+      {
+        version: 7,
+        name: 'tiktok-quality-upgrade-schedule',
+        up: () => this.migrateQualityUpgradeSchedule(),
+      },
     ]);
     this.recoverInterruptedMonitorDownloadRetries();
   }
@@ -486,6 +491,22 @@ export class Store {
     `);
   }
 
+  migrateQualityUpgradeSchedule() {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS quality_upgrade_checks (
+        file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+        first_saved_at INTEGER NOT NULL,
+        stage INTEGER NOT NULL DEFAULT 0 CHECK(stage BETWEEN 0 AND 2),
+        next_check_at INTEGER,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_checked_at INTEGER,
+        last_error TEXT,
+        completed_at INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS idx_quality_upgrade_checks_due
+        ON quality_upgrade_checks(next_check_at, stage);
+    `);
+  }
 
   recoverInterruptedMonitorDownloadRetries(now = Date.now()) {
     return this.db.prepare(`
@@ -4497,6 +4518,149 @@ export class Store {
     if (!ids.length) return 0;
     const placeholders = ids.map(() => '?').join(', ');
     return this.db.prepare(`DELETE FROM jobs WHERE id IN (${placeholders})`).run(...ids).changes;
+  }
+
+  /** Enroll one monitored TikTok video. Unique file_id prevents duplicate checks. */
+  scheduleQualityUpgrade(fileId, now = Date.now()) {
+    const file = this.db.prepare(`
+      SELECT files.*, COALESCE(media_posts.media_type, '') AS media_type
+      FROM files LEFT JOIN media_posts
+        ON media_posts.platform = files.platform AND media_posts.remote_id = files.video_id
+      WHERE files.id = ?
+    `).get(fileId);
+    if (!file || file.platform !== 'tiktok' || file.retention_status !== 'active'
+      || !/\/video\/\d+/.test(file.source_url ?? '')
+      || !/\.mp4$/i.test(file.path ?? '')
+      || /story|slide|photo/i.test(file.media_type ?? '')
+      || now - Number(file.created_at) >= 72 * 60 * 60_000) return false;
+    const age = now - Number(file.created_at);
+    const stage = age >= 24 * 60 * 60_000 ? 1 : 0;
+    const due = age >= (stage === 0 ? 6 : 24) * 60 * 60_000
+      ? now : Number(file.created_at) + (stage === 0 ? 6 : 24) * 60 * 60_000;
+    return this.db.prepare(`
+      INSERT OR IGNORE INTO quality_upgrade_checks (file_id, first_saved_at, stage, next_check_at)
+      VALUES (?, ?, ?, ?)
+    `).run(file.id, file.created_at, stage, due).changes > 0;
+  }
+
+  isQualityUpgradePathExclusive(fileId) {
+    const file = this.db.prepare('SELECT path FROM files WHERE id = ?').get(fileId);
+    if (!file) return false;
+    return this.db.prepare(`
+      SELECT COUNT(*) AS count FROM files
+      WHERE path = ? AND id <> ? AND retention_status = 'active'
+    `).get(file.path, fileId).count === 0;
+  }
+
+  /** Catch up on monitored posts saved in the last 72 hours after an upgrade/restart. */
+  backfillRecentQualityUpgrades(now = Date.now()) {
+    const recent = this.db.prepare(`
+      SELECT DISTINCT files.id
+      FROM files JOIN jobs ON jobs.file_id = files.id AND jobs.type = 'monitor'
+      WHERE files.platform = 'tiktok' AND files.retention_status = 'active'
+        AND files.created_at BETWEEN ? AND ?
+        AND files.source_url LIKE '%/video/%' AND lower(files.path) LIKE '%.mp4'
+      ORDER BY files.created_at DESC LIMIT 200
+    `).all(now - 72 * 60 * 60_000, now);
+    return recent.reduce((count, row) => count + Number(this.scheduleQualityUpgrade(row.id, now)), 0);
+  }
+
+  listQualityUpgradeRecords(limit = 500) {
+    return this.db.prepare(`
+      SELECT q.*, f.id AS file_id, f.video_id, f.platform, f.source_url,
+        f.path, f.size_bytes, f.retention_status,
+        COALESCE(m.media_type, '') AS media_type
+      FROM quality_upgrade_checks q
+      JOIN files f ON f.id = q.file_id
+      LEFT JOIN media_posts m ON m.platform = f.platform AND m.remote_id = f.video_id
+      ORDER BY q.first_saved_at DESC LIMIT ?
+    `).all(Math.min(2000, Math.max(1, Number(limit) || 500)));
+  }
+
+  listDueQualityUpgrades(now = Date.now(), limit = 2) {
+    return this.db.prepare(`
+      SELECT q.*, f.video_id, f.platform, f.source_url, f.username, f.path,
+        f.size_bytes, f.retention_status,
+        COALESCE(m.media_type, '') AS media_type
+      FROM quality_upgrade_checks q
+      JOIN files f ON f.id = q.file_id
+      LEFT JOIN media_posts m ON m.platform = f.platform AND m.remote_id = f.video_id
+      WHERE q.completed_at IS NULL AND q.next_check_at <= ?
+        AND f.retention_status = 'active'
+      ORDER BY q.next_check_at ASC LIMIT ?
+    `).all(now, Math.min(10, Math.max(1, Number(limit) || 2)));
+  }
+
+  #advanceQualityUpgradeStage(fileId, stage, now, error = null) {
+    const row = this.db.prepare(`
+      SELECT first_saved_at FROM quality_upgrade_checks
+      WHERE file_id = ? AND stage = ? AND completed_at IS NULL
+    `).get(fileId, stage);
+    if (!row) throw new Error('The quality-check stage changed before its result was recorded.');
+    // Skip elapsed stages if Docker was shut down during a scheduled check.
+    let nextStage = stage + 1;
+    while (nextStage < 3 && Number(row.first_saved_at) + [6, 24, 72][nextStage] * 60 * 60_000 <= now) {
+      nextStage += 1;
+    }
+    const completed = nextStage >= 3;
+    const nextDue = completed ? null : Number(row.first_saved_at) + [6, 24, 72][nextStage] * 60 * 60_000;
+    this.db.prepare(`
+      UPDATE quality_upgrade_checks SET stage = ?, next_check_at = ?, attempts = 0,
+        last_checked_at = ?, last_error = ?, completed_at = ? WHERE file_id = ?
+    `).run(completed ? stage : nextStage, nextDue, now, error, completed ? now : null, fileId);
+  }
+
+  completeQualityCheck(fileId, stage, now = Date.now()) {
+    this.#advanceQualityUpgradeStage(fileId, stage, now);
+  }
+
+  finishQualityUpgrade(fileId, reason = '', now = Date.now()) {
+    this.db.prepare(`UPDATE quality_upgrade_checks
+      SET next_check_at = NULL, completed_at = ?, last_checked_at = ?, last_error = ?
+      WHERE file_id = ? AND completed_at IS NULL
+    `).run(now, now, reason || null, fileId);
+  }
+
+  failQualityCheck(fileId, stage, error, now = Date.now(), retryDelayMs = 60 * 60_000, maxAttempts = 2) {
+    const row = this.db.prepare(`
+      SELECT attempts FROM quality_upgrade_checks
+      WHERE file_id = ? AND stage = ? AND completed_at IS NULL
+    `).get(fileId, stage);
+    if (!row) return;
+    const attempts = Number(row.attempts) + 1;
+    if (attempts >= maxAttempts) {
+      this.#advanceQualityUpgradeStage(fileId, stage, now, String(error).slice(0, 500));
+    } else {
+      this.db.prepare(`UPDATE quality_upgrade_checks SET attempts = ?, next_check_at = ?,
+        last_checked_at = ?, last_error = ? WHERE file_id = ? AND stage = ?
+      `).run(attempts, now + retryDelayMs, now, String(error).slice(0, 500), fileId, stage);
+    }
+  }
+
+  /** The file path and file ID never change; linked Discord URLs remain valid. */
+  commitQualityUpgrade(fileId, stage, { sizeBytes, width, height }, now = Date.now()) {
+    const positive = [sizeBytes, width, height].every((n) => Number.isSafeInteger(n) && n > 0);
+    if (!positive) throw new Error('Verified replacement size and dimensions must be positive integers.');
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const file = this.db.prepare(`SELECT path FROM files
+        WHERE id = ? AND platform = 'tiktok' AND retention_status = 'active'
+      `).get(fileId);
+      if (!file) throw new Error('Archived file is not active; refusing the quality upgrade.');
+      const valid = this.db.prepare(`SELECT 1 FROM quality_upgrade_checks
+        WHERE file_id = ? AND stage = ? AND completed_at IS NULL
+      `).get(fileId, stage);
+      if (!valid) throw new Error('Quality check has already completed or changed stage.');
+      this.db.prepare('UPDATE files SET size_bytes = ? WHERE id = ?').run(sizeBytes, fileId);
+      this.db.prepare(`UPDATE media_assets
+        SET size_bytes = ?, width = ?, height = ? WHERE file_id = ? AND path = ?
+      `).run(sizeBytes, width, height, fileId, file.path);
+      this.#advanceQualityUpgradeStage(fileId, stage, now);
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   stats() {

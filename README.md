@@ -46,6 +46,8 @@ Implementation progress and remaining work are tracked in [WORKLOG.md](WORKLOG.m
   those posts seen, with scoped Discord commands for inspection and manual retry.
 - Uses a bounded, deduplicated download queue with per-user and per-server limits.
 - Reuses immutable saved assets instead of downloading the same post repeatedly.
+- Optionally rechecks monitored TikTok video quality 6, 24 and 72 hours after
+  saving a post, replacing the archive only when FFprobe verifies an improvement.
 - Delivers small files through Discord and larger files through tokenized links.
 - Supports temporary links, extensions, permanent retention, history, and purge.
 
@@ -308,6 +310,38 @@ Cancel or retry eligible jobs with `POST /api/imports/:id/cancel` and
 `POST /api/imports/:id/retry`. Cancellation is cooperative: an in-flight TikTok
 request finishes before the job stops.
 
+## Optional monitored video quality rechecks
+
+Set `QUALITY_UPGRADE_ENABLED=true` to recheck monitored TikTok video posts at
+6, 24 and 72 hours after they were first saved. The worker polls every 15
+minutes by default, so a due check can start later when the service is busy or
+offline. The schedule persists across restarts, and enabling the feature also
+enrolls eligible monitored posts saved in the previous 72 hours. Stories,
+slideshows and manual downloads are excluded.
+
+If a better format is advertised, the worker downloads it into an isolated
+temporary directory and uses FFprobe to verify that the recorded resolution
+is actually higher. It keeps a safety copy while replacing the archived MP4
+and updating the stored size and dimensions. The file path, archive file ID
+and existing download links stay the same. An unchanged check leaves the
+archived video in place. Failures attempt to restore the original from the
+safety copy, retaining that copy if recovery needs manual attention.
+Transient failures get one retry after an hour;
+the 72-hour check is final. The checks use extra TikTok requests and bandwidth.
+
+```dotenv
+QUALITY_UPGRADE_ENABLED=false
+QUALITY_UPGRADE_POLL_MINUTES=15
+QUALITY_UPGRADE_BATCH_SIZE=2
+```
+
+Quality rechecks are disabled by default. Changing these settings requires a
+backend restart. This feature adds a SQLite schema migration even while it is
+disabled, so back up the database before updating an existing installation.
+FFprobe must be available; the Docker image includes it. Successful upgrades
+are recorded in the backend logs. Separate Discord channels and upgrade
+notifications are planned as a later contribution.
+
 ## Photo/slideshow resolver
 
 Follower-only photo posts are app-gated on the `/photo/{id}` web route, but the
@@ -402,6 +436,7 @@ still needs Cloudflare Access or an equivalent private access layer.
 | Discord | `DISCORD_TOKEN`, `DISCORD_CLIENT_ID`, `DISCORD_OWNER_ID`, `WATCH_MANAGER_ROLE_ID`, `REGISTER_COMMANDS_ON_START` |
 | Public URLs | `PUBLIC_BASE_URL`, `REWIND_PUBLIC_URL`, `CLOUDFLARE_TUNNEL_TOKEN` |
 | Monitoring | `POLL_INTERVAL_SECONDS`, `PROFILE_SCAN_LIMIT`, `PROFILE_BURST_SCAN_LIMIT`, `MONITOR_CONCURRENCY` |
+| Optional quality rechecks | `QUALITY_UPGRADE_ENABLED`, `QUALITY_UPGRADE_POLL_MINUTES`, `QUALITY_UPGRADE_BATCH_SIZE` |
 | Queue limits | `MAX_CONCURRENT_DOWNLOADS`, `MAX_DOWNLOAD_QUEUE_SIZE`, `MAX_QUEUED_DOWNLOADS_PER_USER`, `MAX_QUEUED_DOWNLOADS_PER_GUILD` |
 | Imports | `IMPORT_API_TOKEN`, `IMPORT_MAX_DURATION_SECONDS`, `IMPORT_CONCURRENCY`, `IMPORT_PROFILE_TIMEOUT_SECONDS` |
 | Retention | `DOWNLOAD_LINK_TTL_MINUTES`, `RETENTION_DAYS`, `ARCHIVE_TRASH_RETENTION_DAYS`, `CLEANUP_BATCH_SIZE`, `CLEANUP_ORPHAN_GRACE_MINUTES` |

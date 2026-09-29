@@ -5,6 +5,16 @@ import { DatabaseSync } from 'node:sqlite';
 import os from 'node:os';
 import path from 'node:path';
 import { loadConfig, loadEnvFile, parseNonNegativeInt, parsePositiveInt, validateRuntimeConfig } from '../src/config.js';
+
+test('post quality rechecks are opt-in with bounded batch settings', () => {
+  const defaults = loadConfig({}, '/tmp/project');
+  assert.equal(defaults.qualityUpgradeEnabled, false);
+  assert.equal(defaults.qualityUpgradePollMinutes, 15);
+  assert.equal(defaults.qualityUpgradeBatchSize, 2);
+  const enabled = loadConfig({ QUALITY_UPGRADE_ENABLED: 'true', QUALITY_UPGRADE_BATCH_SIZE: '99' }, '/tmp/project');
+  assert.equal(enabled.qualityUpgradeEnabled, true);
+  assert.equal(enabled.qualityUpgradeBatchSize, 10);
+});
 import {
   extractVideoId,
   extractTikTokUrls,
@@ -1019,7 +1029,7 @@ test('store migrates older databases before creating indexes for new columns', a
     assert.ok(indexes.includes('idx_watched_users_platform_username'));
     assert.ok(indexes.includes('idx_watch_subscriptions_platform_username'));
     assert.deepEqual(migrationColumns, ['version', 'name', 'applied_at']);
-    assert.equal(store.getSchemaVersion(), 6);
+    assert.equal(store.getSchemaVersion(), 7);
     assert.deepEqual(store.listSchemaMigrations().map(({ version, name }) => ({ version, name })), [
       { version: 1, name: 'legacy-schema-bootstrap' },
       { version: 2, name: 'monitor-download-dead-letters' },
@@ -1027,6 +1037,7 @@ test('store migrates older databases before creating indexes for new columns', a
       { version: 4, name: 'rewind-media-read-indexes' },
       { version: 5, name: 'platform-aware-watches' },
       { version: 6, name: 'highlight-check-schedule' },
+      { version: 7, name: 'tiktok-quality-upgrade-schedule' },
     ]);
   } finally {
     store.close();
