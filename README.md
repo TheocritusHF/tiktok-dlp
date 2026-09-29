@@ -13,12 +13,15 @@ Cloudflare Access-protected archive.
 
 Implementation progress and remaining work are tracked in [WORKLOG.md](WORKLOG.md).
 
-> **Proposed from this fork:** [automatic LIVE recording](https://github.com/nqrwhal/tiktok-dlp/pull/23)
-> and [adaptive LIVE quality](https://github.com/nqrwhal/tiktok-dlp/pull/24)
-> are on [separate feature branches](FORK_ROADMAP.md), with both options
-> disabled by default. These proposals are not yet part of the default `main`
-> branch. The [fork roadmap](FORK_ROADMAP.md) explains the branches, settings,
-> and planned follow-ups; the PR pages show current review status.
+> **Proposed from this fork:** [LIVE recording](https://github.com/nqrwhal/tiktok-dlp/pull/23),
+> [adaptive LIVE quality](https://github.com/nqrwhal/tiktok-dlp/pull/24),
+> [post quality rechecks](https://github.com/nqrwhal/tiktok-dlp/pull/25),
+> [dedicated Discord channels](https://github.com/nqrwhal/tiktok-dlp/pull/26),
+> [TikTok URL reliability](https://github.com/nqrwhal/tiktok-dlp/pull/27), and
+> [webcast fallback and reconnects](https://github.com/nqrwhal/tiktok-dlp/pull/28)
+> are on separate feature branches. Their code is not in this default `main`
+> branch. The [fork roadmap](FORK_ROADMAP.md) lists branches, dependencies, and
+> optional settings; the PR pages show current review status.
 
 
 > [!IMPORTANT]
