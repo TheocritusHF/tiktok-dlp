@@ -75,13 +75,19 @@ by default; the dedicated Discord channels are unset. PR #27's URL fix has no
 new toggle. PR #28 still requires `LIVE_RECORDING_ENABLED=true` for its
 optional LIVE behaviors to run.
 
-## Possible combined fork release
+## Combined fork preview
 
-A separate integration or release branch could later combine reviewed features,
-resolve their dependencies, and provide installation instructions for a
-complete fork build. No such release branch has been published yet. Until then,
-each feature branch represents its own proposal; the default `main` branch
-does not install the combined feature set.
+The [combined preview branch](https://github.com/TheocritusHF/tiktok-dlp/tree/release/combined-preview)
+contains PRs #23–#28 in one checkout, with a separate
+[installation guide](https://github.com/TheocritusHF/tiktok-dlp/blob/release/combined-preview/RELEASE_PREVIEW.md).
+The integrated backend passed 259 tests and both Docker image builds. This is
+a branch preview, not a tagged release or an upstream merge. Its optional
+features remain disabled until configured. Back up an existing archive before
+upgrading, since #25 adds a SQLite migration.
+
+The fork's default `main` still contains only the overview and roadmap, not
+the combined feature code. Individual PR branches remain separate for upstream
+review and can change independently of the combined preview.
 
 Fork-specific roadmap changes stay out of upstream feature PRs unless upstream
 asks for them.
