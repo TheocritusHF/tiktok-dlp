@@ -139,8 +139,12 @@ export async function listProfileVideos(usernameOrUrl, options = {}) {
     flatPlaylist: true,
   });
 
+  const playlistUsername = firstValidTikTokUsername(
+    raw.uploader, raw.channel, raw.creator, raw.username,
+    options.username, options.watch?.username, usernameOrUrl, extractUsernameFromUrl(usernameOrUrl),
+  );
   const entries = Array.isArray(raw.entries)
-    ? raw.entries.map((entry, index) => normalizePlaylistEntry(entry, sourceUrl, index))
+    ? raw.entries.map((entry, index) => normalizePlaylistEntry(entry, sourceUrl, index, { username: playlistUsername }))
     : [];
   const metadata = normalizeMetadata(raw, sourceUrl);
   if (cachedSecUid && !metadata.secUid) metadata.secUid = cachedSecUid;
@@ -626,7 +630,12 @@ function normalizePlaylistEntry(entry, sourceUrl, index, defaults = {}) {
   const raw = entry && typeof entry === 'object' ? entry : {};
   const mediaType = resolveMediaType({ ...defaults, ...raw }, raw.webpage_url ?? raw.original_url ?? raw.url ?? sourceUrl);
   const videoId = String(raw.id ?? extractIdFromEntryUrl(raw.url) ?? '');
-  const videoUrl = resolvePlaylistEntryUrl(raw, sourceUrl, mediaType, videoId);
+  const username = firstValidTikTokUsername(
+    raw.uploader, raw.channel, raw.creator, raw.username,
+    ...[raw.webpage_url, raw.original_url, raw.url].filter(isTikTokUrl).map(extractUsernameFromUrl),
+    defaults.username, extractUsernameFromUrl(sourceUrl),
+  );
+  const videoUrl = resolvePlaylistEntryUrl(raw, sourceUrl, mediaType, videoId, username);
   return {
     ...raw,
     id: videoId,
@@ -637,30 +646,33 @@ function normalizePlaylistEntry(entry, sourceUrl, index, defaults = {}) {
     videoUrl,
     videoId,
     title: String(raw.title ?? ''),
-    uploader: String(raw.uploader ?? raw.channel ?? raw.creator ?? ''),
+    uploader: String(raw.uploader ?? raw.channel ?? raw.creator ?? username),
     mediaType,
   };
 }
 
-function resolvePlaylistEntryUrl(entry = {}, sourceUrl = '', mediaType = '', videoId = '') {
+function resolvePlaylistEntryUrl(entry = {}, sourceUrl = '', mediaType = '', videoId = '', username = '') {
+  if (username && /^\d{1,32}$/.test(videoId)) {
+    const kind = mediaType === 'story' ? 'story' : mediaType === 'slideshow' ? 'photo' : 'video';
+    return `https://www.tiktok.com/@${username}/${kind}/${videoId}`;
+  }
+
   for (const value of [entry.webpage_url, entry.original_url, entry.url]) {
     const text = String(value ?? '');
     if (/^https?:\/\//i.test(text)) return text;
   }
-
-  const username = String(
-    entry.uploader
-      ?? entry.channel
-      ?? entry.creator
-      ?? extractUsernameFromUrl(sourceUrl)
-      ?? '',
-  );
-  if (username && videoId) {
-    const kind = mediaType === 'story' ? 'story' : 'video';
-    return `https://www.tiktok.com/@${username}/${kind}/${videoId}`;
-  }
-
   return String(sourceUrl ?? '');
+}
+
+function firstValidTikTokUsername(...values) {
+  for (const value of values) {
+    const username = String(value ?? '').trim().replace(/^@/, '');
+    if (/^[A-Za-z0-9._]{1,32}$/.test(username)
+      && !username.startsWith('.') && !username.endsWith('.') && !username.includes('..')) {
+      return username;
+    }
+  }
+  return '';
 }
 
 function extractUsernameFromUrl(sourceUrl = '') {

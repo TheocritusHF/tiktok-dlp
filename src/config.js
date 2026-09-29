@@ -58,6 +58,9 @@ export function loadConfig(env = process.env, cwd = process.cwd()) {
     discordGuildId: env.DISCORD_GUILD_ID ?? '',
     discordChannelId: env.DISCORD_CHANNEL_ID ?? '',
     discordLiveChannelId: String(env.DISCORD_LIVE_CHANNEL_ID ?? '').trim(),
+    discordNewVideosChannelId: String(env.DISCORD_NEW_VIDEOS_CHANNEL_ID ?? '').trim(),
+    discordNewStoriesChannelId: String(env.DISCORD_NEW_STORIES_CHANNEL_ID ?? '').trim(),
+    discordQualityUpgradesChannelId: String(env.DISCORD_QUALITY_UPGRADES_CHANNEL_ID ?? '').trim(),
     discordOwnerId: env.DISCORD_OWNER_ID ?? '',
     watchManagerRoleId: env.WATCH_MANAGER_ROLE_ID ?? '',
     publicBaseUrl,
@@ -129,6 +132,9 @@ export function loadConfig(env = process.env, cwd = process.cwd()) {
     liveHandles: String(env.LIVE_RECORDING_HANDLES ?? '').split(',')
       .map((name) => name.trim().toLowerCase().replace(/^@/, ''))
       .filter((name) => /^[a-z0-9._]{1,32}$/.test(name) && !name.includes('..')),
+    qualityUpgradeEnabled: parseBoolean(env.QUALITY_UPGRADE_ENABLED, false),
+    qualityUpgradePollMinutes: parsePositiveInt(env.QUALITY_UPGRADE_POLL_MINUTES, 15),
+    qualityUpgradeBatchSize: Math.min(10, parsePositiveInt(env.QUALITY_UPGRADE_BATCH_SIZE, 2)),
     ytdlpRetries: parsePositiveInt(env.YTDLP_RETRIES, 3),
     ytdlpTimeoutMs: parsePositiveInt(env.YTDLP_TIMEOUT_SECONDS, 60) * 1000,
     registerCommandsOnStart: parseBoolean(env.REGISTER_COMMANDS_ON_START, false),

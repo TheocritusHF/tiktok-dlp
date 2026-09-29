@@ -1,5 +1,12 @@
 # tiktok-dlp
 
+> **Combined fork preview:** This branch integrates upstream proposals
+> [#23–#28](RELEASE_PREVIEW.md) for use together. See the
+> [preview installation guide](RELEASE_PREVIEW.md) for setup and feature
+> settings. It is separate from the fork's default `main` and is not a tagged
+> release. Optional recording, quality, and notification features remain off
+> until configured.
+
 Self-hosted social-media downloader and archive for TikTok, Instagram, and X,
 with TikTok monitoring and full-profile imports plus **Rewind**: a private,
 mobile-first feed and dashboard for watching and managing saved videos.
@@ -46,6 +53,8 @@ Implementation progress and remaining work are tracked in [WORKLOG.md](WORKLOG.m
   those posts seen, with scoped Discord commands for inspection and manual retry.
 - Uses a bounded, deduplicated download queue with per-user and per-server limits.
 - Reuses immutable saved assets instead of downloading the same post repeatedly.
+- Optionally rechecks monitored TikTok video quality 6, 24 and 72 hours after
+  saving a post, replacing the archive only when FFprobe verifies an improvement.
 - Delivers small files through Discord and larger files through tokenized links.
 - Supports temporary links, extensions, permanent retention, history, and purge.
 
@@ -308,6 +317,55 @@ Cancel or retry eligible jobs with `POST /api/imports/:id/cancel` and
 `POST /api/imports/:id/retry`. Cancellation is cooperative: an in-flight TikTok
 request finishes before the job stops.
 
+## Optional monitored video quality rechecks
+
+Set `QUALITY_UPGRADE_ENABLED=true` to recheck monitored TikTok video posts at
+6, 24 and 72 hours after they were first saved. The worker polls every 15
+minutes by default, so a due check can start later when the service is busy or
+offline. The schedule persists across restarts, and enabling the feature also
+enrolls eligible monitored posts saved in the previous 72 hours. Stories,
+slideshows and manual downloads are excluded.
+
+If a better format is advertised, the worker downloads it into an isolated
+temporary directory and uses FFprobe to verify that the recorded resolution
+is actually higher. It keeps a safety copy while replacing the archived MP4
+and updating the stored size and dimensions. The file path, archive file ID
+and existing download links stay the same. An unchanged check leaves the
+archived video in place. Failures attempt to restore the original from the
+safety copy, retaining that copy if recovery needs manual attention.
+Transient failures get one retry after an hour;
+the 72-hour check is final. The checks use extra TikTok requests and bandwidth.
+
+```dotenv
+QUALITY_UPGRADE_ENABLED=false
+QUALITY_UPGRADE_POLL_MINUTES=15
+QUALITY_UPGRADE_BATCH_SIZE=2
+```
+
+Quality rechecks are disabled by default. Changing these settings requires a
+backend restart. This feature adds a SQLite schema migration even while it is
+disabled, so back up the database before updating an existing installation.
+FFprobe must be available; the Docker image includes it. Successful upgrades
+are recorded in the backend logs. Set `DISCORD_QUALITY_UPGRADES_CHANNEL_ID` to
+also notify a dedicated channel after an improved file and database update
+succeed. Unchanged checks and failures do not send an upgrade notification.
+
+## Optional Discord archive channels
+
+Set `DISCORD_NEW_VIDEOS_CHANNEL_ID` and `DISCORD_NEW_STORIES_CHANNEL_ID` to
+send additional copies of new monitored TikTok post/slideshow and Story alerts
+to those channels. Existing account watch channels still receive their alerts.
+If the dedicated channel is the same as the account channel, the bot sends only
+one message. Empty settings leave the current routing unchanged. A dedicated
+channel only receives posts watched by a subscription in that same Discord
+server; DM-only watches are never copied into a server channel.
+
+Set `DISCORD_QUALITY_UPGRADES_CHANNEL_ID` for successful quality upgrades.
+The channel must be in a server that still watches the creator. Notification
+failures are logged and do not undo a committed upgrade. Give the bot permission
+to view and send messages in each configured channel. These settings are
+optional and take effect after a backend restart.
+
 ## Photo/slideshow resolver
 
 Follower-only photo posts are app-gated on the `/photo/{id}` web route, but the
@@ -399,9 +457,10 @@ still needs Cloudflare Access or an equivalent private access layer.
 
 | Area | Variables |
 | --- | --- |
-| Discord | `DISCORD_TOKEN`, `DISCORD_CLIENT_ID`, `DISCORD_OWNER_ID`, `WATCH_MANAGER_ROLE_ID`, `REGISTER_COMMANDS_ON_START` |
+| Discord | `DISCORD_TOKEN`, `DISCORD_CLIENT_ID`, `DISCORD_OWNER_ID`, `WATCH_MANAGER_ROLE_ID`, `DISCORD_NEW_VIDEOS_CHANNEL_ID`, `DISCORD_NEW_STORIES_CHANNEL_ID`, `DISCORD_QUALITY_UPGRADES_CHANNEL_ID`, `REGISTER_COMMANDS_ON_START` |
 | Public URLs | `PUBLIC_BASE_URL`, `REWIND_PUBLIC_URL`, `CLOUDFLARE_TUNNEL_TOKEN` |
 | Monitoring | `POLL_INTERVAL_SECONDS`, `PROFILE_SCAN_LIMIT`, `PROFILE_BURST_SCAN_LIMIT`, `MONITOR_CONCURRENCY` |
+| Optional quality rechecks | `QUALITY_UPGRADE_ENABLED`, `QUALITY_UPGRADE_POLL_MINUTES`, `QUALITY_UPGRADE_BATCH_SIZE` |
 | Queue limits | `MAX_CONCURRENT_DOWNLOADS`, `MAX_DOWNLOAD_QUEUE_SIZE`, `MAX_QUEUED_DOWNLOADS_PER_USER`, `MAX_QUEUED_DOWNLOADS_PER_GUILD` |
 | Imports | `IMPORT_API_TOKEN`, `IMPORT_MAX_DURATION_SECONDS`, `IMPORT_CONCURRENCY`, `IMPORT_PROFILE_TIMEOUT_SECONDS` |
 | Retention | `DOWNLOAD_LINK_TTL_MINUTES`, `RETENTION_DAYS`, `ARCHIVE_TRASH_RETENTION_DAYS`, `CLEANUP_BATCH_SIZE`, `CLEANUP_ORPHAN_GRACE_MINUTES` |
@@ -607,6 +666,11 @@ they are not in git.
   and `/ready` report the current database schema version.
 - Watched creator identity data caches TikTok `secUid` and author IDs when
   available.
+- Flat TikTok playlist entries may contain only a post ID, especially when a
+  cached `secUid` is used. Monitoring uses the known creator and ID to build
+  video, photo, or Story links instead of treating the `tiktokuser:` lookup
+  reference or a media URL as a post link. If the creator is unknown, it keeps
+  an absolute entry URL supplied by yt-dlp.
 - Saved-post deletion checks run frequently at first, then around 30 minutes,
   one hour, one day, and weekly.
 - `DOWNLOAD_LINK_TTL_MINUTES` controls new temporary links. Legacy

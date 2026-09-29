@@ -258,6 +258,52 @@ test('fetchVideoMetadata, listProfileVideos, and downloadVideo work with a fake 
   assert.equal(path.relative(finalRoot, movedDownload.primaryFile).startsWith('.tmp'), false);
 });
 
+test('flat TikTok playlists use the known creator and post ID for download URLs', async () => {
+  const fake = await createFakeYtDlp([
+    { id: '7311111111111111111', url: '7311111111111111111' },
+    { id: '7322222222222222222', mediaType: 'story', url: '7322222222222222222' },
+    { id: '7333333333333333333', webpage_url: 'https://www.tiktok.com/@creator/photo/7333333333333333333?share=1' },
+    { id: '7344444444444444444', url: 'https://cdn.example.test/video.mp4' },
+  ]);
+  const profile = await listProfileVideos('https://www.tiktok.com/@creator', {
+    ytdlpPath: fake,
+    username: 'creator',
+    watch: { sec_uid: TEST_SEC_UID },
+  });
+
+  assert.equal(profile.sourceUrl, `tiktokuser:${TEST_SEC_UID}`);
+  assert.deepEqual(profile.entries.map((entry) => entry.url), [
+    'https://www.tiktok.com/@creator/video/7311111111111111111',
+    'https://www.tiktok.com/@creator/story/7322222222222222222',
+    'https://www.tiktok.com/@creator/photo/7333333333333333333',
+    'https://www.tiktok.com/@creator/video/7344444444444444444',
+  ]);
+  assert.ok(profile.entries.every((entry) => entry.uploader === 'creator'));
+
+  const directProfile = await listProfileVideos('https://www.tiktok.com/@creator', { ytdlpPath: fake });
+  assert.equal(directProfile.entries[0].url, 'https://www.tiktok.com/@creator/video/7311111111111111111');
+});
+
+test('playlist URLs prefer a current entry creator and retain yt-dlp URLs without a known creator', async () => {
+  const fake = await createFakeYtDlp([
+    { id: '7355555555555555555', uploader: 'new_creator', url: '7355555555555555555' },
+    { id: '7366666666666666666', url: 'https://www.tiktok.com/t/ZP8GUpGWj/' },
+    { id: '7377777777777777777', webpage_url: 'https://www.tiktok.com/@new_creator/video/7377777777777777777?share=1' },
+  ]);
+  const renamed = await listProfileVideos('https://www.tiktok.com/@old_creator', {
+    ytdlpPath: fake,
+    username: 'old_creator',
+  });
+  assert.equal(renamed.entries[0].url, 'https://www.tiktok.com/@new_creator/video/7355555555555555555');
+  assert.equal(renamed.entries[2].url, 'https://www.tiktok.com/@new_creator/video/7377777777777777777');
+
+  const withoutCreator = await listProfileVideos('', {
+    ytdlpPath: fake,
+    watch: { sec_uid: TEST_SEC_UID },
+  });
+  assert.equal(withoutCreator.entries[1].url, 'https://www.tiktok.com/t/ZP8GUpGWj/');
+});
+
 test('photo post fallback parses and packages slideshow images', async () => {
   const fake = await createUnsupportedYtDlp();
   const fetchImpl = createPhotoFetch();
@@ -697,7 +743,7 @@ test('yt-dlp gets --impersonate chrome and a writable cookies copy, not the moun
   assert.equal(captured[0].env.HTTPS_PROXY, 'http://proxy.test:8888');
 });
 
-async function createFakeYtDlp() {
+async function createFakeYtDlp(playlistEntries = null) {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'fake-ytdlp-'));
   const scriptPath = path.join(dir, 'yt-dlp');
   const script = `#!/usr/bin/env node
@@ -725,11 +771,12 @@ if (has('--dump-single-json')) {
   if (has('--flat-playlist')) {
     const isSecUidProfile = sourceUrl.startsWith('tiktokuser:');
     const secUid = isSecUidProfile ? sourceUrl.slice('tiktokuser:'.length) : 'creator';
+    const fixtureEntries = ${JSON.stringify(playlistEntries)};
     process.stdout.write(JSON.stringify({
       _type: 'playlist',
       id: secUid,
       title: 'Creator uploads',
-      entries: [
+      entries: fixtureEntries ?? [
         { id: '111', title: 'First', uploader: 'creator', uploader_id: '424242424242', channel_id: isSecUidProfile ? secUid : '${TEST_SEC_UID}', webpage_url: 'https://www.tiktok.com/@creator/video/111' },
         { id: '222', title: 'Second', uploader: 'creator', uploader_id: '424242424242', channel_id: isSecUidProfile ? secUid : '${TEST_SEC_UID}', webpage_url: 'https://www.tiktok.com/@creator/video/222' },
       ],

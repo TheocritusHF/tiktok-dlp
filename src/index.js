@@ -18,6 +18,9 @@ import { createDownloadService } from './download/service.js';
 import { createCreatorImportService } from './import/creator.js';
 import { LiveMonitor } from './live/monitor.js';
 import { sendLiveStarted, sendLiveArchived } from './live/discord-notifier.js';
+import { QualityUpgrader } from './quality/upgrader.js';
+import { sendDedicatedMonitorAlert, sendQualityUpgradeAlert } from './discord/archive-notifications.js';
+import { fetchVideoMetadata, downloadVideo as downloadTikTokVideo } from './tiktok/ytdlp.js';
 
 export async function deliverMonitorAlerts(targets, deliver, {
   videoId = 'unknown',
@@ -179,14 +182,27 @@ if (process.env.NODE_ENV !== 'test') {
         const adapter = platform === 'instagram' ? instagramPlatformAdapter : tiktokPlatformAdapter;
         return adapter.listCreatorStories(username, { ...config, ...options });
       },
-      downloadVideo: async (video, options = {}) => downloadOne(video.url || video.webpage_url || video.sourceUrl || options.sourceUrl, {
-        type: 'monitor',
-        username: options.username || video.username,
-        platform: options.platform || video.platform || options.watch?.platform || 'tiktok',
-        permanent: true,
-        metadata: video.mediaType === 'story' ? video : null,
-        createDelivery: false,
-      }),
+      downloadVideo: async (video, options = {}) => {
+        const result = await downloadOne(
+          video.url || video.webpage_url || video.sourceUrl || options.sourceUrl,
+          {
+            type: 'monitor',
+            username: options.username || video.username,
+            platform: options.platform || video.platform || options.watch?.platform || 'tiktok',
+            permanent: true,
+            metadata: video.mediaType === 'story' ? video : null,
+            createDelivery: false,
+          },
+        );
+        if (config.qualityUpgradeEnabled && !result?.reused && result?.fileId
+          && result.platform === 'tiktok'
+          && !['story', 'slideshow'].includes(resolveVideoMediaType(video))
+          && !/story|photo|slide/i.test(String(result.mediaType ?? ''))) {
+          try { store.scheduleQualityUpgrade(result.fileId); }
+          catch (error) { console.warn(`[quality] Could not schedule ${result.videoId}: ${error.message}`); }
+        }
+        return result;
+      },
       checkVideoAvailable,
     },
     alert: async ({ result, video, watch }) => {
@@ -199,27 +215,43 @@ if (process.env.NODE_ENV !== 'test') {
         guild_id: '',
         channel_id: watch?.channel_id || config.discordChannelId,
       }];
-      await deliverMonitorAlerts(targets, async (subscription) => {
-        const targetScope = await resolveMonitorDeliveryScope(discordClient, subscription);
-        const scopedResult = await downloadService.createDeliveryForAsset(result, {
-          type: 'monitor',
-          guildId: targetScope.guildId,
-          channelId: targetScope.channelId,
-          scopeId: targetScope.scopeId,
-          permanent: true,
+      let accountDeliveryError = null;
+      try {
+        await deliverMonitorAlerts(targets, async (subscription) => {
+          const targetScope = await resolveMonitorDeliveryScope(discordClient, subscription);
+          const scopedResult = await downloadService.createDeliveryForAsset(result, {
+            type: 'monitor',
+            guildId: targetScope.guildId,
+            channelId: targetScope.channelId,
+            scopeId: targetScope.scopeId,
+            permanent: true,
+          });
+          await sendVideoAlert({
+            client: discordClient,
+            config,
+            result: scopedResult,
+            video,
+            watch: { ...watch, channel_id: subscription.channel_id },
+          });
+        }, {
+          videoId: video?.id ?? video?.video_id ?? 'unknown',
+          eventType: 'new_post',
+          store,
         });
-        await sendVideoAlert({
-          client: discordClient,
-          config,
-          result: scopedResult,
-          video,
-          watch: { ...watch, channel_id: subscription.channel_id },
+      } catch (error) {
+        accountDeliveryError = error;
+      }
+      try {
+        await sendDedicatedMonitorAlert({
+          client: discordClient, config, store, downloadService,
+          result, video, watch, targets, platform,
         });
-      }, {
-        videoId: video?.id ?? video?.video_id ?? 'unknown',
-        eventType: 'new_post',
-        store,
-      });
+      } catch (error) {
+        // An optional archive channel cannot prevent the watched post from
+        // being marked delivered in its existing subscription channel(s).
+        console.warn(`[discord] Dedicated monitor alert failed: ${error.message}`);
+      }
+      if (accountDeliveryError) throw accountDeliveryError;
     },
     deletionAlert: async ({ video, reason }) => {
       if (!discordClient) {
@@ -373,15 +405,29 @@ if (process.env.NODE_ENV !== 'test') {
       );
     },
   }) : null;
+  const qualityWorker = !config.qualityUpgradeEnabled ? null : new QualityUpgrader({
+    store,
+    config,
+    probeVideo: fetchVideoMetadata,
+    downloadVideo: downloadTikTokVideo,
+    onUpgrade: (upgrade) => sendQualityUpgradeAlert({
+      client: discordClient, config, store, upgrade,
+    }),
+    pollIntervalMs: config.qualityUpgradePollMinutes * 60_000,
+    batchSize: config.qualityUpgradeBatchSize,
+  });
+
   const httpService = await startHttpServer({ config, store, monitor, creatorImportService });
   discordClient = await startDiscordBot({ config, store, monitor, downloadOne, downloadService, registerCommands });
   await liveWorker?.start();
+  await qualityWorker?.start();
 
   async function shutdown(signal) {
     console.log(`[shutdown] Received ${signal}`);
     monitor.stop();
     clearInterval(cleanupTimer);
     await liveWorker?.stop();
+    await qualityWorker?.stop();
     const importDrain = creatorImportService.stop?.({ drain: true });
     await discordClient?.destroy?.();
     await new Promise((resolve) => httpService.server.close(resolve));
