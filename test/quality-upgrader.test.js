@@ -56,6 +56,7 @@ test('6, 24 and 72 hour checks survive DB restart and finish after the final che
     assert.equal(row.stage, 0);
     assert.equal(row.next_check_at, f.firstSavedAt + 6 * HOUR);
     const due6 = f.firstSavedAt + 6 * HOUR;
+    const notifications = [];
     const worker = new QualityUpgrader({ store: f.store, config: { downloadDir: f.downloadDir },
       inspect, probeVideo: async () => ({ id: ID, formats: [{ width: 720, height: 1280, vcodec: 'hevc' }] }),
       downloadVideo: async (url, options) => {
@@ -64,6 +65,9 @@ test('6, 24 and 72 hour checks survive DB restart and finish after the final che
         const candidate = path.join(options.outputDir, `${ID}.mp4`);
         await writeFile(candidate, 'new-720-long');
         return { primaryFile: candidate, videoId: ID };
+      }, onUpgrade: async (upgrade) => {
+        assert.equal(f.store.getLatestFileByPost('tiktok', ID).size_bytes, 12);
+        notifications.push(upgrade);
       }, now: () => due6, logger,
     });
     await worker.runOnce();
@@ -71,6 +75,8 @@ test('6, 24 and 72 hour checks survive DB restart and finish after the final che
     assert.equal((await stat(f.filepath)).size, f.store.getLatestFileByPost('tiktok', ID).size_bytes);
     assert.equal(f.store.getLatestFileByPost('tiktok', ID).id, f.fileId);
     assert.equal(f.store.db.prepare("SELECT file_id FROM link_tokens WHERE token = 'existing-archive-link'").get().file_id, f.fileId);
+    assert.deepEqual(notifications.map((upgrade) => [upgrade.username, upgrade.previous.width, upgrade.current.width]),
+      [['example_creator', 576, 720]]);
     assert.deepEqual(f.store.listMediaAssetsForFile(f.fileId)
       .filter((asset) => asset.path === f.filepath)
       .map((asset) => [asset.width, asset.height, asset.size_bytes]), [[720, 1280, 12]]);
@@ -82,9 +88,11 @@ test('6, 24 and 72 hour checks survive DB restart and finish after the final che
     f.store = createStore(path.join(f.root, 'state.db'));
     assert.equal(f.store.getToken('existing-archive-link').id, f.fileId);
     // A second worker instance sees the persisted state after a database restart.
+    const unexpectedNotifications = [];
     const worker24 = new QualityUpgrader({ store: f.store, config: { downloadDir: f.downloadDir },
       inspect, probeVideo: async () => ({ id: ID, formats: [{ width: 720, height: 1280, vcodec: 'hevc' }] }),
       downloadVideo: async () => { throw new Error('No higher format means no download.'); },
+      onUpgrade: () => unexpectedNotifications.push('24h'),
       now: () => f.firstSavedAt + 24 * HOUR, logger,
     });
     await worker24.runOnce();
@@ -94,14 +102,38 @@ test('6, 24 and 72 hour checks survive DB restart and finish after the final che
     const worker72 = new QualityUpgrader({ store: f.store, config: { downloadDir: f.downloadDir },
       inspect, probeVideo: async () => ({ id: ID, formats: [{ width: 720, height: 1280, vcodec: 'hevc' }] }),
       downloadVideo: async () => { throw new Error('No download expected.'); },
+      onUpgrade: () => unexpectedNotifications.push('72h'),
       now: () => f.firstSavedAt + 72 * HOUR, logger,
     });
     await worker72.runOnce();
+    assert.deepEqual(unexpectedNotifications, []);
     row = f.store.listQualityUpgradeRecords()[0];
     assert.equal(row.completed_at, f.firstSavedAt + 72 * HOUR);
     assert.equal(row.next_check_at, null);
     assert.equal(f.store.listDueQualityUpgrades(f.firstSavedAt + 96 * HOUR).length, 0);
     assert.equal(f.store.db.prepare('PRAGMA integrity_check').get().integrity_check, 'ok');
+  } finally { await f.cleanup(); }
+});
+
+test('failed upgrade notification cannot undo a committed improvement', async () => {
+  const f = await fixture();
+  try {
+    f.store.scheduleQualityUpgrade(f.fileId, f.firstSavedAt);
+    const warnings = [];
+    const worker = new QualityUpgrader({ store: f.store, config: { downloadDir: f.downloadDir },
+      inspect, probeVideo: async () => ({ id: ID, formats: [{ width: 720, height: 1280, vcodec: 'hevc' }] }),
+      downloadVideo: async (_url, options) => {
+        const candidate = path.join(options.outputDir, `${ID}.mp4`);
+        await writeFile(candidate, 'new-720-long');
+        return { primaryFile: candidate };
+      }, onUpgrade: async () => { throw new Error('Discord unavailable'); },
+      now: () => f.firstSavedAt + 6 * HOUR,
+      logger: { info() {}, warn(message) { warnings.push(message); }, error() {} },
+    });
+    await worker.runOnce();
+    assert.equal(await readFile(f.filepath, 'utf8'), 'new-720-long');
+    assert.equal(f.store.listQualityUpgradeRecords()[0].stage, 1);
+    assert.match(warnings.join('\n'), /Upgrade notification failed/);
   } finally { await f.cleanup(); }
 });
 
@@ -138,16 +170,19 @@ test('failed database commit rolls the archived bytes back and schedules a retry
     f.store.scheduleQualityUpgrade(f.fileId, f.firstSavedAt);
     f.store.commitQualityUpgrade = () => { throw new Error('simulated database write failure'); };
     const due = f.firstSavedAt + 6 * HOUR;
+    const notifications = [];
     const worker = new QualityUpgrader({ store: f.store, config: { downloadDir: f.downloadDir },
       inspect, probeVideo: async () => ({ id: ID, formats: [{ width: 720, height: 1280, vcodec: 'hevc' }] }),
       downloadVideo: async (url, options) => {
         const candidate = path.join(options.outputDir, `${ID}.mp4`);
         await writeFile(candidate, 'new-720-long');
         return { primaryFile: candidate };
-      }, now: () => due, logger });
+      }, onUpgrade: () => notifications.push('unexpected'),
+      now: () => due, logger });
     await worker.runOnce();
     assert.equal(await readFile(f.filepath, 'utf8'), 'old-576');
     assert.equal(f.store.getLatestFileByPost('tiktok', ID).size_bytes, 7);
+    assert.deepEqual(notifications, []);
     assert.equal(f.store.listDueQualityUpgrades(due + HOUR).length, 1);
   } finally { await f.cleanup(); }
 });

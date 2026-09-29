@@ -42,12 +42,13 @@ export async function inspectVideoResolution(filePath, { executable = 'ffprobe' 
 /** Keeps the same archived path/file_id so existing download links remain valid. */
 export class QualityUpgrader {
   constructor({ store, config, probeVideo, downloadVideo, inspect = inspectVideoResolution,
-    logger = console, now = () => Date.now(), pollIntervalMs = 15 * 60_000, batchSize = 2,
+    onUpgrade = null, logger = console, now = () => Date.now(),
+    pollIntervalMs = 15 * 60_000, batchSize = 2,
   } = {}) {
     if (!store || !config?.downloadDir || !probeVideo || !downloadVideo) {
       throw new Error('QualityUpgrader requires store, downloadDir, probeVideo and downloadVideo.');
     }
-    Object.assign(this, { store, config, probeVideo, downloadVideo, inspect, logger, now,
+    Object.assign(this, { store, config, probeVideo, downloadVideo, inspect, onUpgrade, logger, now,
       pollIntervalMs, batchSize });
     this.timer = null;
     this.inFlight = null;
@@ -172,6 +173,16 @@ export class QualityUpgrader {
       await refreshInfoJson(staging, originalPath).catch((error) =>
         this.logger.warn?.(`[quality] Metadata refresh skipped for ${record.video_id}: ${error.message}`));
       this.logger.info?.(`[quality] UPGRADED ${record.video_id}: ${original.width}x${original.height} -> ${candidate.width}x${candidate.height} (${stageLabel(stage)}).`);
+      if (this.onUpgrade) {
+        try {
+          await this.onUpgrade({
+            videoId: record.video_id, username: record.username, sourceUrl: record.source_url,
+            previous: original, current: candidate,
+          });
+        } catch (error) {
+          this.logger.warn?.(`[quality] Upgrade notification failed for ${record.video_id}: ${error.message}`);
+        }
+      }
     } catch (error) {
       this.logger.warn?.(`[quality] ${record.video_id} ${stageLabel(stage)} failed: ${error.message}`);
       // If an interrupted replacement left a safety copy, do not allow the

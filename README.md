@@ -339,8 +339,25 @@ Quality rechecks are disabled by default. Changing these settings requires a
 backend restart. This feature adds a SQLite schema migration even while it is
 disabled, so back up the database before updating an existing installation.
 FFprobe must be available; the Docker image includes it. Successful upgrades
-are recorded in the backend logs. Separate Discord channels and upgrade
-notifications are planned as a later contribution.
+are recorded in the backend logs. Set `DISCORD_QUALITY_UPGRADES_CHANNEL_ID` to
+also notify a dedicated channel after an improved file and database update
+succeed. Unchanged checks and failures do not send an upgrade notification.
+
+## Optional Discord archive channels
+
+Set `DISCORD_NEW_VIDEOS_CHANNEL_ID` and `DISCORD_NEW_STORIES_CHANNEL_ID` to
+send additional copies of new monitored TikTok post/slideshow and Story alerts
+to those channels. Existing account watch channels still receive their alerts.
+If the dedicated channel is the same as the account channel, the bot sends only
+one message. Empty settings leave the current routing unchanged. A dedicated
+channel only receives posts watched by a subscription in that same Discord
+server; DM-only watches are never copied into a server channel.
+
+Set `DISCORD_QUALITY_UPGRADES_CHANNEL_ID` for successful quality upgrades.
+The channel must be in a server that still watches the creator. Notification
+failures are logged and do not undo a committed upgrade. Give the bot permission
+to view and send messages in each configured channel. These settings are
+optional and take effect after a backend restart.
 
 ## Photo/slideshow resolver
 
@@ -433,7 +450,7 @@ still needs Cloudflare Access or an equivalent private access layer.
 
 | Area | Variables |
 | --- | --- |
-| Discord | `DISCORD_TOKEN`, `DISCORD_CLIENT_ID`, `DISCORD_OWNER_ID`, `WATCH_MANAGER_ROLE_ID`, `REGISTER_COMMANDS_ON_START` |
+| Discord | `DISCORD_TOKEN`, `DISCORD_CLIENT_ID`, `DISCORD_OWNER_ID`, `WATCH_MANAGER_ROLE_ID`, `DISCORD_NEW_VIDEOS_CHANNEL_ID`, `DISCORD_NEW_STORIES_CHANNEL_ID`, `DISCORD_QUALITY_UPGRADES_CHANNEL_ID`, `REGISTER_COMMANDS_ON_START` |
 | Public URLs | `PUBLIC_BASE_URL`, `REWIND_PUBLIC_URL`, `CLOUDFLARE_TUNNEL_TOKEN` |
 | Monitoring | `POLL_INTERVAL_SECONDS`, `PROFILE_SCAN_LIMIT`, `PROFILE_BURST_SCAN_LIMIT`, `MONITOR_CONCURRENCY` |
 | Optional quality rechecks | `QUALITY_UPGRADE_ENABLED`, `QUALITY_UPGRADE_POLL_MINUTES`, `QUALITY_UPGRADE_BATCH_SIZE` |

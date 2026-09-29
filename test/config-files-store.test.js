@@ -15,6 +15,20 @@ test('post quality rechecks are opt-in with bounded batch settings', () => {
   assert.equal(enabled.qualityUpgradeEnabled, true);
   assert.equal(enabled.qualityUpgradeBatchSize, 10);
 });
+test('dedicated Discord notification channels are optional and separate', () => {
+  const defaults = loadConfig({}, '/tmp/project');
+  assert.equal(defaults.discordNewVideosChannelId, '');
+  assert.equal(defaults.discordNewStoriesChannelId, '');
+  assert.equal(defaults.discordQualityUpgradesChannelId, '');
+  const config = loadConfig({
+    DISCORD_NEW_VIDEOS_CHANNEL_ID: ' video-channel ',
+    DISCORD_NEW_STORIES_CHANNEL_ID: ' story-channel ',
+    DISCORD_QUALITY_UPGRADES_CHANNEL_ID: ' quality-channel ',
+  }, '/tmp/project');
+  assert.equal(config.discordNewVideosChannelId, 'video-channel');
+  assert.equal(config.discordNewStoriesChannelId, 'story-channel');
+  assert.equal(config.discordQualityUpgradesChannelId, 'quality-channel');
+});
 import {
   extractVideoId,
   extractTikTokUrls,
