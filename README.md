@@ -607,6 +607,11 @@ they are not in git.
   and `/ready` report the current database schema version.
 - Watched creator identity data caches TikTok `secUid` and author IDs when
   available.
+- Flat TikTok playlist entries may contain only a post ID, especially when a
+  cached `secUid` is used. Monitoring uses the known creator and ID to build
+  video, photo, or Story links instead of treating the `tiktokuser:` lookup
+  reference or a media URL as a post link. If the creator is unknown, it keeps
+  an absolute entry URL supplied by yt-dlp.
 - Saved-post deletion checks run frequently at first, then around 30 minutes,
   one hour, one day, and weekly.
 - `DOWNLOAD_LINK_TTL_MINUTES` controls new temporary links. Legacy
