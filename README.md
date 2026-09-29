@@ -23,6 +23,12 @@ Implementation progress and remaining work are tracked in [WORKLOG.md](WORKLOG.m
 > branch. The [fork roadmap](FORK_ROADMAP.md) lists branches, dependencies, and
 > optional settings; the PR pages show current review status.
 
+> **Want the features together?** The
+> [combined preview branch](https://github.com/TheocritusHF/tiktok-dlp/tree/release/combined-preview)
+> contains PRs #23–#28 in one checkout. Follow its
+> [installation guide](https://github.com/TheocritusHF/tiktok-dlp/blob/release/combined-preview/RELEASE_PREVIEW.md).
+> It is an integration preview, not a tagged release.
+
 
 > [!IMPORTANT]
 > Optional, platform-specific Netscape cookies authenticate as a real account so
