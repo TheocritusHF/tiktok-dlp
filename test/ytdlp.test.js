@@ -258,6 +258,43 @@ test('fetchVideoMetadata, listProfileVideos, and downloadVideo work with a fake 
   assert.equal(path.relative(finalRoot, movedDownload.primaryFile).startsWith('.tmp'), false);
 });
 
+test('profile listings canonicalize cached secUid URLs and preserve fallback URLs', async (t) => {
+  const id = '7688708922114444596';
+  const badUrl = `https://www.tiktok.com/@${TEST_SEC_UID}/video/${id}`;
+  const cases = [
+    { name: 'cached secUid with entry username', entry: { channel: 'creator', webpage_url: badUrl }, username: 'creator' },
+    { name: 'options username with bare id', entry: { id: undefined, url: id }, options: { username: 'creator' }, username: 'creator' },
+    { name: 'watch username', entry: { url: badUrl }, options: { watch: { username: 'creator', sec_uid: TEST_SEC_UID } }, username: 'creator' },
+    { name: 'profile URL username with cached secUid', input: 'https://www.tiktok.com/@creator', entry: { url: id }, username: 'creator' },
+    { name: 'plain profile username with cached secUid', input: 'creator', entry: { url: id }, username: 'creator' },
+    { name: 'direct profile', input: 'https://www.tiktok.com/@creator', options: { secUid: '' }, entry: { url: id }, username: 'creator' },
+    { name: 'photo kind', entry: { uploader: 'creator', webpage_url: badUrl.replace('/video/', '/photo/') }, username: 'creator', kind: 'photo' },
+    { name: 'story kind', entry: { uploader: 'creator', mediaType: 'story', url: badUrl }, username: 'creator', kind: 'story' },
+    { name: 'renamed entry wins', input: 'https://www.tiktok.com/@old_name', options: { username: 'old_name' }, entry: { uploader: 'new_name', url: badUrl }, username: 'new_name' },
+    { name: 'invalid display name skips to channel', entry: { uploader: 'Display Name!', channel: 'creator', url: badUrl }, username: 'creator' },
+    { name: 'empty fields skip to entry username', entry: { uploader: '', channel: '', username: 'creator', url: id }, username: 'creator' },
+    { name: 'uploader profile URL', entry: { uploader_url: 'https://www.tiktok.com/@creator', url: id }, username: 'creator' },
+    { name: 'secUid is not a username', entry: { uploader: TEST_SEC_UID, url: id }, expected: '' },
+    { name: 'absolute fallback without username', entry: { webpage_url: `https://www.tiktok.com/t/example/` }, expected: 'https://www.tiktok.com/t/example/' },
+    { name: 'lookup string is not a fallback', entry: { url: id }, expected: '' },
+    { name: 'nonnumeric id cannot form canonical URL', entry: { id: 'invalid', uploader: 'creator', url: badUrl }, expected: badUrl },
+  ];
+  for (const scenario of cases) {
+    await t.test(scenario.name, async () => {
+      const fake = await createFakeYtDlp([{ id, ...scenario.entry }]);
+      const result = await listProfileVideos(scenario.input ?? '', {
+        ytdlpPath: fake,
+        secUid: TEST_SEC_UID,
+        ...scenario.options,
+      });
+      const expected = scenario.expected ?? `https://www.tiktok.com/@${scenario.username}/${scenario.kind ?? 'video'}/${id}`;
+      assert.equal(result.entries[0].videoUrl, expected);
+      assert.equal(result.entries[0].url, expected);
+      assert.equal(result.entries[0].webpage_url, expected);
+    });
+  }
+});
+
 test('photo post fallback parses and packages slideshow images', async () => {
   const fake = await createUnsupportedYtDlp();
   const fetchImpl = createPhotoFetch();
@@ -697,7 +734,7 @@ test('yt-dlp gets --impersonate chrome and a writable cookies copy, not the moun
   assert.equal(captured[0].env.HTTPS_PROXY, 'http://proxy.test:8888');
 });
 
-async function createFakeYtDlp() {
+async function createFakeYtDlp(entries) {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'fake-ytdlp-'));
   const scriptPath = path.join(dir, 'yt-dlp');
   const script = `#!/usr/bin/env node
@@ -719,6 +756,11 @@ if (has('--dump-single-json')) {
         { id: '3333333333', title: 'Story', url: '3333333333', duration: 12 },
       ],
     }));
+    process.exit(0);
+  }
+
+  if (has('--flat-playlist') && ${JSON.stringify(entries) ?? 'null'}) {
+    process.stdout.write(JSON.stringify({ entries: ${JSON.stringify(entries) ?? 'null'} }));
     process.exit(0);
   }
 
