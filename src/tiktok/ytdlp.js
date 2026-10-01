@@ -1,6 +1,6 @@
 import { spawn as defaultSpawn } from 'node:child_process';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { mkdir, mkdtemp, readdir, rename, rm, stat, writeFile, copyFile, chmod } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile, copyFile, chmod } from 'node:fs/promises';
 import { once } from 'node:events';
 import { Readable } from 'node:stream';
 import os from 'node:os';
@@ -31,7 +31,7 @@ const DISCORD_COMPATIBLE_FORMAT = [
   'bv*[vcodec^=avc]+ba',
   'b[vcodec^=avc]',
   'bv*+ba',
-  'b',
+  'b[vcodec!=?none]',
 ].join('/');
 
 const DOWNLOAD_BASE_ARGS = [
@@ -110,7 +110,12 @@ export function buildDownloadArgs(sourceUrl, options = {}) {
   const maxBytes = normalizePositiveInt(options.maxMediaDownloadBytes);
   if (maxBytes) args.push('--max-filesize', String(maxBytes));
   if (Array.isArray(options.extraArgs)) args.push(...options.extraArgs.map(String));
-  args.push('--', String(sourceUrl));
+  if (options.infoJsonFile) {
+    // Raise download errors so yt-dlp's info-file loader can refresh expired URLs.
+    args.push('--abort-on-error', '--load-info-json', String(options.infoJsonFile));
+  } else {
+    args.push('--', String(sourceUrl));
+  }
   return args;
 }
 
@@ -247,16 +252,17 @@ export async function downloadVideo(sourceUrl, options = {}) {
     let stdout = '';
     let stderr = '';
     try {
-      const result = await runYtDlp(ytdlpPath, buildDownloadArgs(sourceUrl, {
+      const result = await runVideoDownload(ytdlpPath, sourceUrl, metadata, {
         ...options,
         outputDir: tempDir,
-      }), options);
+      });
       stdout = result.stdout;
       stderr = result.stderr;
     } catch (error) {
       if (!shouldTryPhotoFallback(sourceUrl, error, options)) throw error;
       const slideshowDir = await prepareSlideshowWorkDir(workDir);
-      return await downloadPhotoPost(sourceUrl, await fetchPhotoPostMetadata(sourceUrl, options), slideshowDir, options);
+      const photoMetadata = mergeDownloadedMetadata(metadata, await fetchPhotoPostMetadata(sourceUrl, options));
+      return await downloadPhotoPost(sourceUrl, photoMetadata, slideshowDir, options);
     }
 
     let downloadDir = tempDir;
@@ -271,7 +277,6 @@ export async function downloadVideo(sourceUrl, options = {}) {
       });
     }
 
-    const normalized = normalizeMetadata(metadata, sourceUrl);
     if (!pickPrimaryVideo(files)) {
       const noVideoError = Object.assign(new Error('yt-dlp completed without producing a playable video file.'), {
         kind: 'no_video_file',
@@ -291,13 +296,14 @@ export async function downloadVideo(sourceUrl, options = {}) {
         }
         if (photoMetadata) {
           const slideshowDir = await prepareSlideshowWorkDir(workDir);
-          return downloadPhotoPost(sourceUrl, photoMetadata, slideshowDir, options);
+          return downloadPhotoPost(sourceUrl, mergeDownloadedMetadata(metadata, photoMetadata), slideshowDir, options);
         }
       }
 
       throw noVideoError;
     }
 
+    const normalized = normalizeMetadata(await readDownloadedMetadata(files, metadata), sourceUrl);
     if (options.downloadDir) {
       const layout = makeDownloadLayout({ downloadDir: options.downloadDir }, normalized);
       downloadDir = layout.dir;
@@ -323,6 +329,7 @@ export async function downloadVideo(sourceUrl, options = {}) {
       thumbnailUrl: normalized.thumbnail || '',
       mediaType: normalized.mediaType || '',
       duration: numberOrNull(normalized.duration) ?? 0,
+      timestamp: numberOrNull(normalized.timestamp),
       stdout,
       stderr,
     };
@@ -501,6 +508,60 @@ export function classifyYtdlpError(error, options = {}) {
   return makeClassification('yt_dlp_error', 'yt-dlp failed.', false, exitCode, signal, stdout, stderr);
 }
 
+async function runVideoDownload(executable, sourceUrl, metadata, options) {
+  let infoDir = '';
+  try {
+    let infoJsonFile = '';
+    if (
+      metadata?.id
+      && (!metadata._type || metadata._type === 'video')
+      && Array.isArray(metadata.formats)
+      && metadata.formats.length > 0
+      && metadata.formats.every((format) => typeof format?.url === 'string' && format.url.length > 0)
+    ) {
+      infoDir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-download-info-'));
+      infoJsonFile = path.join(infoDir, 'input.json');
+      await writeFile(infoJsonFile, JSON.stringify({ ...metadata, webpage_url: sourceUrl }), { mode: 0o600 });
+    }
+    return await runYtDlp(executable, buildDownloadArgs(sourceUrl, { ...options, infoJsonFile }), options);
+  } finally {
+    if (infoDir) await rm(infoDir, { recursive: true, force: true });
+  }
+}
+
+async function readDownloadedMetadata(files, metadata) {
+  const sidecar = files.find((file) => path.basename(file) === `${metadata.id}.info.json`);
+  if (!sidecar) {
+    if (typeof metadata.title === 'string') return metadata;
+    throw Object.assign(new Error('yt-dlp did not write metadata for the downloaded video.'), {
+      kind: 'missing_download_metadata',
+    });
+  }
+  let extracted;
+  try {
+    extracted = JSON.parse(await readFile(sidecar, 'utf8'));
+  } catch (cause) {
+    throw Object.assign(new Error('yt-dlp wrote invalid metadata for the downloaded video.'), {
+      kind: 'invalid_download_metadata', cause,
+    });
+  }
+  if (String(extracted?.id) !== String(metadata.id) || typeof extracted?.title !== 'string') {
+    throw Object.assign(new Error('yt-dlp metadata does not match the downloaded post.'), {
+      kind: 'invalid_download_metadata',
+    });
+  }
+  return mergeDownloadedMetadata(metadata, extracted);
+}
+
+function mergeDownloadedMetadata(metadata, extracted) {
+  return {
+    ...metadata,
+    ...extracted,
+    ...(metadata.uploader ? { uploader: metadata.uploader } : {}),
+    ...(metadata.username ? { username: metadata.username } : {}),
+  };
+}
+
 async function runYtDlp(executable, args, options = {}) {
   await loadTikTokCookieSession(options);
   const cookiesStaging = await stageCookiesCopy(options);
@@ -643,12 +704,20 @@ function normalizePlaylistEntry(entry, sourceUrl, index, defaults = {}) {
 }
 
 function resolvePlaylistEntryUrl(entry = {}, sourceUrl = '', mediaType = '', videoId = '') {
-  for (const value of [entry.webpage_url, entry.original_url, entry.url]) {
-    const text = String(value ?? '');
-    if (/^https?:\/\//i.test(text)) return text;
+  const provided = [entry.webpage_url, entry.original_url, entry.url]
+    .map((value) => String(value ?? ''))
+    .find((text) => /^https?:\/\//i.test(text)) ?? '';
+  // secUid-cached profile listings make yt-dlp return secUid-based post URLs
+  // (/@MS4wLjABAAAA.../video/123). Prefer the human handle yt-dlp also reports
+  // so monitor source URLs stay canonical and human-readable.
+  const humanHandle = extractHumanTikTokHandle(entry);
+  if (provided && humanHandle) {
+    const rewritten = rewriteTikTokUrlHandle(provided, humanHandle);
+    if (rewritten) return rewritten;
   }
+  if (provided) return provided;
 
-  const username = String(
+  const username = humanHandle || String(
     entry.uploader
       ?? entry.channel
       ?? entry.creator
@@ -661,6 +730,32 @@ function resolvePlaylistEntryUrl(entry = {}, sourceUrl = '', mediaType = '', vid
   }
 
   return String(sourceUrl ?? '');
+}
+
+function extractHumanTikTokHandle(entry = {}) {
+  const fromUploaderUrl = String(entry.uploader_url ?? '').match(/tiktok\.com\/@([A-Za-z0-9._]{1,32})(?:[/?#]|$)/i)?.[1];
+  if (fromUploaderUrl && !fromUploaderUrl.includes('..')) return fromUploaderUrl;
+  // yt-dlp `uploader` is the author's unique handle; `channel` is the display
+  // nickname and must not be used as a URL handle.
+  const uploader = String(entry.uploader ?? '');
+  if (/^[A-Za-z0-9._]{1,32}$/.test(uploader) && !uploader.includes('..')) return uploader;
+  return '';
+}
+
+function rewriteTikTokUrlHandle(urlText, handle) {
+  try {
+    const url = new URL(String(urlText));
+    if (!/(^|\.)tiktok\.com$/i.test(url.hostname)) return '';
+    const parts = url.pathname.split('/');
+    if (parts.length >= 4 && parts[1].startsWith('@') && /^(video|photo|story)$/i.test(parts[2] ?? '')) {
+      parts[1] = `@${handle}`;
+      url.pathname = parts.join('/');
+      return url.href;
+    }
+  } catch {
+    // Fall through to the provided URL unchanged.
+  }
+  return '';
 }
 
 function extractUsernameFromUrl(sourceUrl = '') {
@@ -1000,7 +1095,8 @@ async function downloadPhotoPost(sourceUrl, metadata, tempDir, options = {}) {
     mediaType: 'slideshow',
     imageCount: imageEntries.length,
     slideshowImagePaths,
-    duration: 0,
+    duration: numberOrNull(normalized.duration) ?? 0,
+    timestamp: numberOrNull(normalized.timestamp),
     stdout: '',
     stderr: '',
   };
@@ -1087,6 +1183,7 @@ async function downloadStoryPost(sourceUrl, metadata, tempDir, options = {}) {
     thumbnailUrl: normalized.thumbnail || '',
     mediaType: 'story',
     duration: numberOrNull(normalized.duration) ?? 0,
+    timestamp: numberOrNull(normalized.timestamp),
     stdout: '',
     stderr: '',
   };

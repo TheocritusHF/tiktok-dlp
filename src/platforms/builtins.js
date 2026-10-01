@@ -71,7 +71,7 @@ export const tiktokAdapter = definePlatformAdapter({
     creatorListing: true,
     stories: true,
     availability: true,
-    probeBeforeDownload: true,
+    probeBeforeDownload: false,
     archiveOwnedStaging: false,
     preferRequestedCreatorHandle: true,
     legacyVideoIdentity: true,

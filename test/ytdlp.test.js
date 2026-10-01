@@ -1,5 +1,7 @@
-import { mkdtemp, chmod, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { access, mkdtemp, chmod, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { readFileSync, statSync } from 'node:fs';
 import { spawn as defaultSpawn } from 'node:child_process';
+import { createServer } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { strict as assert } from 'node:assert';
@@ -18,6 +20,21 @@ import {
 } from '../src/tiktok/ytdlp.js';
 
 const TEST_SEC_UID = `MS4wLjABAAAA${'a'.repeat(64)}`;
+const COMPLETE_VIDEO_METADATA = {
+  id: '9876543210',
+  title: 'A video',
+  uploader: 'creator',
+  webpage_url: 'https://www.tiktok.com/@creator/video/9876543210',
+  extractor_key: 'TikTok',
+  formats: [{
+    format_id: 'h264',
+    url: 'https://cdn.example.test/video.mp4',
+    ext: 'mp4',
+    vcodec: 'h264',
+    acodec: 'aac',
+    http_headers: { Referer: 'https://www.tiktok.com/' },
+  }],
+};
 
 test('buildMetadataArgs builds a conservative metadata command', () => {
   const args = buildMetadataArgs('https://www.tiktok.com/@user/video/123', {
@@ -83,7 +100,7 @@ test('buildDownloadArgs points yt-dlp at explicit output dirs', () => {
     '20',
     '--no-playlist',
     '--format',
-    'bv*[vcodec^=h264]+ba/b[vcodec^=h264]/bv*[vcodec^=avc]+ba/b[vcodec^=avc]/bv*+ba/b',
+    'bv*[vcodec^=h264]+ba/b[vcodec^=h264]/bv*[vcodec^=avc]+ba/b[vcodec^=avc]/bv*+ba/b[vcodec!=?none]',
     '--restrict-filenames',
     '--merge-output-format',
     'mp4',
@@ -241,6 +258,7 @@ test('fetchVideoMetadata, listProfileVideos, and downloadVideo work with a fake 
   assert.equal(storyDownload.mediaType, 'story');
   assert.equal(storyDownload.filename, '3333333333.mp4');
   assert.equal(storyDownload.duration, 12);
+  assert.equal(storyDownload.timestamp, stories.entries[0].timestamp);
   assert.ok(storyDownload.primaryFile.startsWith(storyRoot));
   assert.equal((await readFile(storyDownload.primaryFile)).toString(), 'fake story video');
 
@@ -256,6 +274,310 @@ test('fetchVideoMetadata, listProfileVideos, and downloadVideo work with a fake 
   assert.equal(path.basename(movedDownload.primaryFile), 'downloaded.mp4');
   assert.ok(movedDownload.primaryFile.startsWith(finalRoot));
   assert.equal(path.relative(finalRoot, movedDownload.primaryFile).startsWith('.tmp'), false);
+});
+
+test('canonical downloads extract once and use saved metadata before naming and returning the video', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'tiktok-single-extraction-'));
+  const timestamp = Date.parse('2026-01-02T03:04:05Z') / 1000;
+  const savedMetadata = {
+    id: '9876543210', title: 'Fresh title', description: 'Fresh description',
+    uploader: 'actual.creator', timestamp, duration: 12.5,
+    thumbnail: 'https://cdn.example.test/fresh.jpg',
+  };
+  const fake = await createFakeYtDlp({ savedMetadata });
+  try {
+    for (const metadata of [
+      { id: '9876543210' },
+      { id: '9876543210', uploader: 'requested.creator', title: 'Old title', description: 'Old description', duration: 99 },
+    ]) {
+      const calls = [];
+      const result = await downloadVideo('https://www.tiktok.com/@creator/video/9876543210', {
+        metadata,
+        ytdlpPath: fake,
+        downloadDir: root,
+        spawnImpl(executable, args, options) {
+          calls.push(args);
+          return defaultSpawn(executable, args, options);
+        },
+      });
+      assert.equal(calls.length, 1);
+      assert.equal(calls[0].includes('--dump-single-json'), false);
+      assert.equal(calls[0].includes('--load-info-json'), false);
+      assert.equal(result.videoId, '9876543210');
+      assert.equal(result.username, metadata.uploader || savedMetadata.uploader);
+      assert.equal(result.title, savedMetadata.title);
+      assert.equal(result.description, savedMetadata.description);
+      assert.equal(result.duration, savedMetadata.duration);
+      assert.equal(result.thumbnailUrl, savedMetadata.thumbnail);
+      assert.equal(result.timestamp, timestamp);
+      assert.equal(result.metadata.timestamp, timestamp);
+      assert.equal(result.downloadDir, path.join(root, result.username, '2026', '01', '02'));
+      assert.equal(path.basename(result.primaryFile), 'downloaded.mp4');
+      assert.equal(await readFile(result.primaryFile, 'utf8'), 'fake video');
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(path.dirname(fake), { recursive: true, force: true });
+  }
+});
+
+for (const invalid of ['missing', 'corrupt', 'mismatched', 'incomplete']) {
+  test(`skeletal download metadata rejects ${invalid} saved metadata without moving caller files`, async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'tiktok-invalid-sidecar-'));
+    const outputDir = path.join(root, 'caller');
+    const savedMetadata = invalid === 'mismatched'
+      ? { id: '1111111111', title: 'Another post' }
+      : invalid === 'incomplete' ? { id: '9876543210' } : undefined;
+    const fake = await createFakeYtDlp({ savedMetadata, sidecarText: invalid === 'corrupt' ? '{invalid' : undefined });
+    try {
+      await mkdir(outputDir);
+      await writeFile(path.join(outputDir, 'keep.txt'), 'caller-owned');
+      await writeFile(path.join(outputDir, 'another.info.json'), JSON.stringify({ id: '1111111111', title: 'Another post' }));
+      await assert.rejects(downloadVideo('https://www.tiktok.com/@creator/video/9876543210', {
+        metadata: { id: '9876543210' },
+        ytdlpPath: fake,
+        outputDir,
+        downloadDir: path.join(root, 'archive'),
+      }), { kind: invalid === 'missing' ? 'missing_download_metadata' : 'invalid_download_metadata' });
+      assert.equal(await readFile(path.join(outputDir, 'keep.txt'), 'utf8'), 'caller-owned');
+      assert.equal(await readFile(path.join(outputDir, 'downloaded.mp4'), 'utf8'), 'fake video');
+      await assert.rejects(access(path.join(root, 'archive')), { code: 'ENOENT' });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+      await rm(path.dirname(fake), { recursive: true, force: true });
+    }
+  });
+}
+
+test('invalid metadata removes downloader-owned staging', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'tiktok-sidecar-staging-'));
+  const fake = await createFakeYtDlp();
+  try {
+    await assert.rejects(downloadVideo('https://www.tiktok.com/@creator/video/9876543210', {
+      metadata: { id: '9876543210' }, ytdlpPath: fake, downloadDir: root,
+    }), { kind: 'missing_download_metadata' });
+    assert.deepEqual(await readdir(path.join(root, '.tmp')), []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(path.dirname(fake), { recursive: true, force: true });
+  }
+});
+
+test('downloads reuse complete metadata with private temporary info and unchanged download options', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ytdlp-info-reuse-'));
+  const fake = await createFakeYtDlp();
+  const cookiesFile = path.join(dir, 'cookies.txt');
+  await writeFile(cookiesFile, '# Netscape HTTP Cookie File\n.tiktok.com\tTRUE\t/\tTRUE\t2147483647\tsessionid\tfixture\n');
+  const captured = [];
+  try {
+    const result = await downloadVideo(COMPLETE_VIDEO_METADATA.webpage_url, {
+      metadata: COMPLETE_VIDEO_METADATA,
+      ytdlpPath: fake,
+      outputDir: path.join(dir, 'output'),
+      cookiesFile,
+      proxy: 'http://proxy.test:8888',
+      format: 'b[vcodec^=h264]',
+      ytdlpRetries: 2,
+      maxMediaDownloadBytes: 512,
+      spawnImpl(executable, args, options) {
+        const infoFile = args[args.indexOf('--load-info-json') + 1];
+        captured.push({
+          args,
+          infoFile,
+          metadata: JSON.parse(readFileSync(infoFile, 'utf8')),
+          fileMode: statSync(infoFile).mode & 0o777,
+          dirMode: statSync(path.dirname(infoFile)).mode & 0o777,
+        });
+        return defaultSpawn(executable, args, options);
+      },
+    });
+    assert.equal(captured.length, 1);
+    const { args, infoFile, metadata, fileMode, dirMode } = captured[0];
+    assert.deepEqual(metadata, COMPLETE_VIDEO_METADATA);
+    assert.equal(fileMode, 0o600);
+    assert.equal(dirMode, 0o700);
+    assert.ok(args.includes('--abort-on-error'));
+    assert.equal(args.includes('--'), false);
+    assert.equal(args.includes(COMPLETE_VIDEO_METADATA.webpage_url), false);
+    assert.equal(args[args.indexOf('--format') + 1], 'b[vcodec^=h264]');
+    assert.equal(args[args.indexOf('--impersonate') + 1], 'chrome');
+    assert.equal(args[args.indexOf('--proxy') + 1], 'http://proxy.test:8888');
+    assert.equal(args[args.indexOf('--retries') + 1], '2');
+    assert.equal(args[args.indexOf('--max-filesize') + 1], '512');
+    assert.notEqual(args[args.indexOf('--cookies') + 1], cookiesFile);
+    await assert.rejects(access(path.dirname(infoFile)), { code: 'ENOENT' });
+    assert.deepEqual(result.files.map((file) => path.basename(file)), ['downloaded.mp4']);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await rm(path.dirname(fake), { recursive: true, force: true });
+  }
+});
+
+test('incomplete and playlist metadata retain URL extraction', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ytdlp-info-incomplete-'));
+  const fake = await createFakeYtDlp();
+  try {
+    for (const partial of [
+      { formats: undefined },
+      { formats: [] },
+      { formats: [{ format_id: 'missing-url' }] },
+      { _type: 'url' },
+    ]) {
+      await downloadVideo(COMPLETE_VIDEO_METADATA.webpage_url, {
+        metadata: { ...COMPLETE_VIDEO_METADATA, ...partial },
+        ytdlpPath: fake,
+        outputDir: dir,
+        spawnImpl(executable, args, options) {
+          assert.equal(args.includes('--load-info-json'), false);
+          assert.equal(args.at(-1), COMPLETE_VIDEO_METADATA.webpage_url);
+          return defaultSpawn(executable, args, options);
+        },
+      });
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await rm(path.dirname(fake), { recursive: true, force: true });
+  }
+});
+
+test('temporary download metadata is removed before photo fallback and after subprocess errors', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ytdlp-info-cleanup-'));
+  const unsupported = await createUnsupportedYtDlp();
+  const denied = await createPrivateYtDlp();
+  let fallbackDir;
+  try {
+    await writeFile(path.join(dir, 'keep.txt'), 'caller-owned');
+    for (const ytdlpPath of [unsupported, denied]) {
+      let infoFile;
+      const photoFetch = createPhotoFetch();
+      const operation = downloadVideo(COMPLETE_VIDEO_METADATA.webpage_url, {
+        metadata: COMPLETE_VIDEO_METADATA,
+        outputDir: dir,
+        ytdlpPath,
+        spawnImpl(executable, args, options) {
+          infoFile = args[args.indexOf('--load-info-json') + 1];
+          assert.equal(statSync(infoFile).isFile(), true);
+          return defaultSpawn(executable, args, options);
+        },
+        async fetchImpl(...args) {
+          await assert.rejects(access(infoFile), { code: 'ENOENT' });
+          return photoFetch(...args);
+        },
+      });
+      if (ytdlpPath === denied) {
+        await assert.rejects(operation, { kind: 'access_denied' });
+      } else {
+        const result = await operation;
+        fallbackDir = result.downloadDir;
+        assert.equal(result.mediaType, 'slideshow');
+        assert.ok(result.files.every((file) => !file.includes('tiktok-download-info-')));
+      }
+      await assert.rejects(access(path.dirname(infoFile)), { code: 'ENOENT' });
+      assert.equal(await readFile(path.join(dir, 'keep.txt'), 'utf8'), 'caller-owned');
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    if (fallbackDir) await rm(fallbackDir, { recursive: true, force: true });
+    await rm(path.dirname(unsupported), { recursive: true, force: true });
+    await rm(path.dirname(denied), { recursive: true, force: true });
+  }
+});
+
+test('native yt-dlp reuses info formats and refreshes expired URLs without a custom retry', {
+  skip: !process.env.YTDLP_NATIVE_TEST_PATH,
+}, async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ytdlp-native-info-'));
+  const media = Buffer.alloc(4096, 21);
+  const requests = [];
+  const server = createServer((request, response) => {
+    requests.push(request.url);
+    if (request.url === '/expired.mp4' || request.url === '/unavailable.mp4') {
+      response.writeHead(403);
+      response.end();
+      return;
+    }
+    response.writeHead(200, { 'content-type': 'video/mp4', 'content-length': media.length });
+    response.end(request.method === 'HEAD' ? null : media);
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  try {
+    for (const scenario of ['url-extraction', 'ready', 'expired', 'unavailable']) {
+      requests.length = 0;
+      const infoJsonFile = path.join(dir, `${scenario}.json`);
+      const outputDir = path.join(dir, scenario);
+      await writeFile(infoJsonFile, JSON.stringify({
+        ...COMPLETE_VIDEO_METADATA,
+        extractor: 'generic',
+        extractor_key: 'Generic',
+        webpage_url: `${origin}/${scenario === 'unavailable' ? 'unavailable' : 'refreshed'}.mp4`,
+        formats: [{ ...COMPLETE_VIDEO_METADATA.formats[0], url: `${origin}/${scenario === 'ready' ? 'ready' : 'expired'}.mp4` }],
+      }));
+      const startedAt = performance.now();
+      const args = scenario === 'url-extraction'
+        ? buildDownloadArgs(`${origin}/ready.mp4`, { outputDir })
+        : buildDownloadArgs('https://www.tiktok.com/@creator/video/9876543210', { infoJsonFile, outputDir });
+      const result = await new Promise((resolve, reject) => {
+        const child = defaultSpawn(process.env.YTDLP_NATIVE_TEST_PATH, args);
+        let stderr = '';
+        child.stdout.resume();
+        child.stderr.on('data', (chunk) => { stderr += chunk; });
+        child.once('error', reject);
+        child.once('close', (code) => resolve({ code, stderr }));
+      });
+      assert.equal(result.code, scenario === 'unavailable' ? 1 : 0, result.stderr);
+      if (scenario !== 'unavailable') {
+        const video = (await readdir(outputDir)).find((file) => file.endsWith('.mp4'));
+        assert.ok(video);
+        assert.deepEqual(await readFile(path.join(outputDir, video)), media);
+      }
+      if (scenario === 'url-extraction') assert.deepEqual(requests, ['/ready.mp4', '/ready.mp4']);
+      else if (scenario === 'ready') assert.deepEqual(requests, ['/ready.mp4']);
+      else if (scenario === 'expired') assert.deepEqual(requests, ['/expired.mp4', '/refreshed.mp4', '/refreshed.mp4']);
+      else assert.deepEqual(requests, ['/expired.mp4', '/unavailable.mp4']);
+      t.diagnostic(`${scenario}: ${requests.length} local requests, exit ${result.code}, ${(performance.now() - startedAt).toFixed(0)} ms.`);
+    }
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('secUid profile listings rewrite entry URLs to the human handle', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'fake-ytdlp-secid-'));
+  const scriptPath = path.join(dir, 'yt-dlp');
+  const script = `#!/usr/bin/env node
+const args = process.argv.slice(2);
+const sourceUrl = args[args.length - 1] || '';
+const secUid = sourceUrl.startsWith('tiktokuser:') ? sourceUrl.slice('tiktokuser:'.length) : 'creator';
+process.stdout.write(JSON.stringify({
+  _type: 'playlist',
+  id: secUid,
+  entries: [
+    { id: '111', title: 'First', uploader: 'creator', uploader_url: 'https://www.tiktok.com/@creator', uploader_id: '424242424242', channel_id: secUid, webpage_url: 'https://www.tiktok.com/@' + secUid + '/video/111' },
+    { id: '222', title: 'Second', uploader_id: '424242424242', channel_id: secUid, webpage_url: 'https://www.tiktok.com/@' + secUid + '/video/222' },
+  ],
+}));
+process.exit(0);
+`;
+  await writeFile(scriptPath, script, { mode: 0o755 });
+  await chmod(scriptPath, 0o755);
+
+  const profile = await listProfileVideos('https://www.tiktok.com/@creator', {
+    ytdlpPath: scriptPath,
+    username: 'creator',
+    watch: { sec_uid: TEST_SEC_UID },
+  });
+  assert.equal(profile.entries.length, 2);
+  // Human handle available: rewritten to the canonical human URL.
+  assert.equal(profile.entries[0].webpage_url, 'https://www.tiktok.com/@creator/video/111');
+  assert.equal(profile.entries[0].url, 'https://www.tiktok.com/@creator/video/111');
+  // No human handle available: secUid URL preserved (still downloadable).
+  assert.equal(
+    profile.entries[1].webpage_url,
+    `https://www.tiktok.com/@${TEST_SEC_UID}/video/222`,
+  );
 });
 
 test('photo post fallback parses and packages slideshow images', async () => {
@@ -347,8 +669,44 @@ test('downloadVideo converts artifact-only photo posts through the slideshow fal
   });
 
   assert.equal(result.mediaType, 'slideshow');
+  assert.equal(result.timestamp, result.metadata.timestamp);
+  assert.ok(result.timestamp > 0);
   assert.equal(path.extname(result.primaryFile), '.zip');
   assert.ok((await readFile(result.primaryFile)).includes(Buffer.from('manifest.json')));
+});
+
+test('canonical slideshow fallback preserves publication, soundtrack duration, and the requested creator', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'tiktok-photo-single-extraction-'));
+  const executables = [await createUnsupportedYtDlp(), await createArtifactOnlyYtDlp()];
+  try {
+    for (const ytdlpPath of executables) {
+      let subprocesses = 0;
+      const result = await downloadVideo('https://www.tiktok.com/@requested.creator/video/7640994586499878174', {
+        metadata: { id: '7640994586499878174', uploader: 'requested.creator', username: 'requested.creator' },
+        ytdlpPath,
+        downloadDir: root,
+        fetchImpl: createPhotoFetch([], { duration: 23 }),
+        spawnImpl(executable, args, options) {
+          subprocesses += 1;
+          assert.equal(args.includes('--dump-single-json'), false);
+          return defaultSpawn(executable, args, options);
+        },
+      });
+      assert.equal(subprocesses, 1);
+      assert.equal(result.mediaType, 'slideshow');
+      assert.equal(result.username, 'requested.creator');
+      assert.equal(result.metadata.username, 'requested.creator');
+      assert.equal(result.timestamp, 1779057706);
+      assert.equal(result.duration, 23);
+      assert.equal(result.title, 'I know this much is true');
+      assert.equal(result.thumbnailUrl, 'https://cdn.example.test/one.jpeg');
+      assert.equal(result.downloadDir, path.join(root, 'requested.creator', '2026', '05', '17'));
+      assert.equal(result.filename, '20260517T224146Z__requested.creator__7640994586499878174.zip');
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    for (const executable of executables) await rm(path.dirname(executable), { recursive: true, force: true });
+  }
 });
 
 test('photo fallback ignores leftover video artifacts and preserves caller outputDir', async () => {
@@ -697,9 +1055,12 @@ test('yt-dlp gets --impersonate chrome and a writable cookies copy, not the moun
   assert.equal(captured[0].env.HTTPS_PROXY, 'http://proxy.test:8888');
 });
 
-async function createFakeYtDlp() {
+async function createFakeYtDlp({ savedMetadata, sidecarText } = {}) {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'fake-ytdlp-'));
   const scriptPath = path.join(dir, 'yt-dlp');
+  const metadataText = sidecarText ?? (savedMetadata === undefined ? undefined : JSON.stringify(savedMetadata));
+  const sidecarWrite = metadataText === undefined ? ''
+    : `fs.writeFileSync(path.join(downloadDir, '9876543210.info.json'), ${JSON.stringify(metadataText)});`;
   const script = `#!/usr/bin/env node
 const fs = require('node:fs');
 const path = require('node:path');
@@ -757,6 +1118,7 @@ if (!downloadDir) {
 fs.mkdirSync(downloadDir, { recursive: true });
 const outputPath = path.join(downloadDir, 'downloaded.mp4');
 fs.writeFileSync(outputPath, 'fake video');
+${sidecarWrite}
 process.stdout.write(outputPath + '\\n');
 process.exit(0);
 `;
@@ -852,7 +1214,7 @@ function headerValue(headers, name) {
   return match ? String(match[1]) : '';
 }
 
-function createPhotoFetch(calls = []) {
+function createPhotoFetch(calls = [], { duration = 0 } = {}) {
   return async (url, init = {}) => {
     calls.push({ url: String(url), init });
     const textUrl = String(url);
@@ -870,7 +1232,7 @@ function createPhotoFetch(calls = []) {
       ok: true,
       status: 200,
       url: 'https://www.tiktok.com/@user400567892112/photo/7640994586499878174',
-      text: async () => makePhotoHtml(),
+      text: async () => makePhotoHtml({ duration }),
     };
   };
 }
@@ -965,7 +1327,7 @@ function makeStoryProfileHtml({ userStoryStatus = 1 } = {}) {
   return `<html><script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">${JSON.stringify(data)}</script></html>`;
 }
 
-function makePhotoHtml() {
+function makePhotoHtml({ duration = 0 } = {}) {
   const data = {
     __DEFAULT_SCOPE__: {
       'webapp.reflow.video.detail': {
@@ -974,6 +1336,7 @@ function makePhotoHtml() {
             id: '7640994586499878174',
             desc: 'I know this much is true',
             createTime: '1779057706',
+            music: { duration },
             author: {
               uniqueId: 'user400567892112',
               nickname: 'creator',

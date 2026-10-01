@@ -29,6 +29,9 @@ export {
   downloadGalleryDlPost,
   parseGalleryDlProbeOutput,
   probeGalleryDlPost,
+  recordPrivateListingOutcome,
+  resetPrivateListingBreakerForTests,
+  shouldSkipPrivateListings,
 } from './galleryDl.js';
 
 export const platformRegistry = createPlatformRegistry(builtInPlatformAdapters);

@@ -1075,16 +1075,9 @@ export class Store {
     if (!scope || typeof scope !== 'object') {
       this.db.exec('BEGIN IMMEDIATE');
       try {
-        if (scope && typeof scope === 'object' && scope.platform) {
-          this.db.prepare('DELETE FROM watch_subscriptions WHERE platform = ? AND username = ?').run(platform, normalizedUsername);
-          const result = this.db.prepare('DELETE FROM watched_users WHERE platform = ? AND username = ?').run(platform, normalizedUsername);
-          this.clearDeletionChecksForUsername(normalizedUsername, platform);
-          this.db.exec('COMMIT');
-          return result.changes > 0;
-        }
-        this.db.prepare('DELETE FROM watch_subscriptions WHERE username = ?').run(normalizedUsername);
-        const result = this.db.prepare('DELETE FROM watched_users WHERE username = ?').run(normalizedUsername);
-        this.clearDeletionChecksForUsername(normalizedUsername);
+        this.db.prepare('DELETE FROM watch_subscriptions WHERE platform = ? AND username = ?').run(platform, normalizedUsername);
+        const result = this.db.prepare('DELETE FROM watched_users WHERE platform = ? AND username = ?').run(platform, normalizedUsername);
+        this.clearDeletionChecksForUsername(normalizedUsername, platform);
         this.db.exec('COMMIT');
         return result.changes > 0;
       } catch (error) {
@@ -1094,14 +1087,13 @@ export class Store {
     }
 
     const guildId = String(scope.guildId ?? scope.guild_id ?? '');
-    const scopePlatform = normalizePlatform(scope.platform ?? platform);
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      const result = this.db.prepare('DELETE FROM watch_subscriptions WHERE platform = ? AND username = ? AND guild_id = ?').run(scopePlatform, normalizedUsername, guildId);
-      const remaining = this.db.prepare('SELECT 1 FROM watch_subscriptions WHERE platform = ? AND username = ? LIMIT 1').get(scopePlatform, normalizedUsername);
+      const result = this.db.prepare('DELETE FROM watch_subscriptions WHERE platform = ? AND username = ? AND guild_id = ?').run(platform, normalizedUsername, guildId);
+      const remaining = this.db.prepare('SELECT 1 FROM watch_subscriptions WHERE platform = ? AND username = ? LIMIT 1').get(platform, normalizedUsername);
       if (!remaining) {
-        this.db.prepare('DELETE FROM watched_users WHERE platform = ? AND username = ?').run(scopePlatform, normalizedUsername);
-        this.clearDeletionChecksForUsername(normalizedUsername, scopePlatform);
+        this.db.prepare('DELETE FROM watched_users WHERE platform = ? AND username = ?').run(platform, normalizedUsername);
+        this.clearDeletionChecksForUsername(normalizedUsername, platform);
       }
       this.db.exec('COMMIT');
       return result.changes > 0;
@@ -1114,96 +1106,23 @@ export class Store {
   getWatch(username, platform = 'tiktok') {
     const normalizedUsername = String(username ?? '').trim();
     if (!normalizedUsername) return null;
-    // Allow calling with object like { platform, username } or platform string
-    if (typeof platform === 'object' && platform !== null && platform.platform) {
-      const p = normalizePlatform(platform.platform);
-      try {
-        return this.db.prepare('SELECT * FROM watched_users WHERE platform = ? AND username = ?').get(p, normalizedUsername) ?? null;
-      } catch {
-        return this.db.prepare('SELECT * FROM watched_users WHERE username = ?').get(normalizedUsername) ?? null;
-      }
-    }
-    const normalizedPlatform = normalizePlatform(platform ?? 'tiktok');
-    try {
-      return this.db.prepare('SELECT * FROM watched_users WHERE platform = ? AND username = ?').get(normalizedPlatform, normalizedUsername) ?? null;
-    } catch {
-      return this.db.prepare('SELECT * FROM watched_users WHERE username = ?').get(normalizedUsername) ?? null;
-    }
+    const normalizedPlatform = normalizePlatform(platform?.platform ?? platform ?? 'tiktok');
+    return this.db.prepare('SELECT * FROM watched_users WHERE platform = ? AND username = ?').get(normalizedPlatform, normalizedUsername) ?? null;
   }
 
   listWatches(filter = null) {
-    if (filter && typeof filter === 'object' && filter.platform) {
-      const platform = normalizePlatform(filter.platform);
-      try {
-        return this.db.prepare(`
-          SELECT *
-          FROM watched_users
-          WHERE platform = ?
-          ORDER BY COALESCE(next_check_at, 0), username
-        `).all(platform);
-      } catch {
-        return this.db.prepare(`SELECT * FROM watched_users ORDER BY COALESCE(next_check_at, 0), username`).all().filter((r) => (r.platform ?? 'tiktok') === platform);
-      }
-    }
-    if (typeof filter === 'string' && filter) {
-      const platform = normalizePlatform(filter);
-      try {
-        return this.db.prepare(`
-          SELECT *
-          FROM watched_users
-          WHERE platform = ?
-          ORDER BY COALESCE(next_check_at, 0), username
-        `).all(platform);
-      } catch {
-        return this.db.prepare(`SELECT * FROM watched_users ORDER BY COALESCE(next_check_at, 0), username`).all().filter((r) => (r.platform ?? 'tiktok') === platform);
-      }
-    }
-    try {
-      return this.db.prepare(`
-        SELECT *
-        FROM watched_users
-        ORDER BY platform, COALESCE(next_check_at, 0), username
-      `).all();
-    } catch {
-      return this.db.prepare(`SELECT * FROM watched_users ORDER BY COALESCE(next_check_at, 0), username`).all();
-    }
+    const platform = typeof filter === 'string' ? filter : filter?.platform;
+    return this.db.prepare(`
+      SELECT *
+      FROM watched_users
+      ${platform ? 'WHERE platform = ?' : ''}
+      ORDER BY platform, COALESCE(next_check_at, 0), username
+    `).all(...(platform ? [normalizePlatform(platform)] : []));
   }
 
   listWatchesForScope({ guildId = '', channelId = '', platform = '' } = {}) {
     const normalizedPlatform = platform ? normalizePlatform(platform) : '';
-    if (normalizedPlatform) {
-      try {
-        return this.db.prepare(`
-          WITH ranked_subscriptions AS (
-            SELECT watch_subscriptions.*,
-              ROW_NUMBER() OVER (
-                PARTITION BY watch_subscriptions.platform, watch_subscriptions.username
-                ORDER BY CASE WHEN watch_subscriptions.guild_id = ? THEN 0 ELSE 1 END,
-                  watch_subscriptions.id
-              ) AS scope_rank
-            FROM watch_subscriptions
-            WHERE platform = ?
-              AND (
-                watch_subscriptions.guild_id = ?
-                OR (
-                  watch_subscriptions.guild_id = ''
-                  AND watch_subscriptions.channel_id = ?
-                )
-              )
-          )
-          SELECT watched_users.*, ranked_subscriptions.channel_id AS subscription_channel_id,
-            ranked_subscriptions.created_by AS subscription_created_by
-          FROM ranked_subscriptions
-          JOIN watched_users ON watched_users.platform = ranked_subscriptions.platform AND watched_users.username = ranked_subscriptions.username
-          WHERE ranked_subscriptions.scope_rank = 1
-          ORDER BY watched_users.username
-        `).all(String(guildId ?? ''), normalizedPlatform, String(guildId ?? ''), String(channelId ?? ''));
-      } catch {
-        return [];
-      }
-    }
-    try {
-      return this.db.prepare(`
+    return this.db.prepare(`
         WITH ranked_subscriptions AS (
           SELECT watch_subscriptions.*,
             ROW_NUMBER() OVER (
@@ -1212,11 +1131,12 @@ export class Store {
                 watch_subscriptions.id
             ) AS scope_rank
           FROM watch_subscriptions
-          WHERE watch_subscriptions.guild_id = ?
+          WHERE (watch_subscriptions.guild_id = ?
             OR (
               watch_subscriptions.guild_id = ''
               AND watch_subscriptions.channel_id = ?
-            )
+            ))
+            ${normalizedPlatform ? 'AND watch_subscriptions.platform = ?' : ''}
         )
         SELECT watched_users.*, ranked_subscriptions.channel_id AS subscription_channel_id,
           ranked_subscriptions.created_by AS subscription_created_by
@@ -1224,51 +1144,18 @@ export class Store {
         JOIN watched_users ON watched_users.platform = ranked_subscriptions.platform AND watched_users.username = ranked_subscriptions.username
         WHERE ranked_subscriptions.scope_rank = 1
         ORDER BY watched_users.platform, watched_users.username
-      `).all(String(guildId ?? ''), String(guildId ?? ''), String(channelId ?? ''));
-    } catch {
-      // Fallback for legacy DB without platform column
-      return this.db.prepare(`
-        WITH ranked_subscriptions AS (
-          SELECT watch_subscriptions.*,
-            ROW_NUMBER() OVER (
-              PARTITION BY watch_subscriptions.username
-              ORDER BY CASE WHEN watch_subscriptions.guild_id = ? THEN 0 ELSE 1 END,
-                watch_subscriptions.id
-            ) AS scope_rank
-          FROM watch_subscriptions
-          WHERE watch_subscriptions.guild_id = ?
-            OR (
-              watch_subscriptions.guild_id = ''
-              AND watch_subscriptions.channel_id = ?
-            )
-        )
-        SELECT watched_users.*, ranked_subscriptions.channel_id AS subscription_channel_id,
-          ranked_subscriptions.created_by AS subscription_created_by
-        FROM ranked_subscriptions
-        JOIN watched_users ON watched_users.username = ranked_subscriptions.username
-        WHERE ranked_subscriptions.scope_rank = 1
-        ORDER BY watched_users.username
-      `).all(String(guildId ?? ''), String(guildId ?? ''), String(channelId ?? ''));
-    }
+      `).all(String(guildId ?? ''), String(guildId ?? ''), String(channelId ?? ''), ...(normalizedPlatform ? [normalizedPlatform] : []));
   }
 
   getWatchSubscription(username, { guildId = '', platform = 'tiktok' } = {}) {
     const normalizedUsername = String(username ?? '').trim();
     const normalizedGuildId = String(guildId ?? '');
     const normalizedPlatform = normalizePlatform(platform ?? 'tiktok');
-    try {
-      return this.db.prepare(`
-        SELECT *
-        FROM watch_subscriptions
-        WHERE platform = ? AND username = ? AND guild_id = ?
-      `).get(normalizedPlatform, normalizedUsername, normalizedGuildId) ?? null;
-    } catch {
-      return this.db.prepare(`
-        SELECT *
-        FROM watch_subscriptions
-        WHERE username = ? AND guild_id = ?
-      `).get(normalizedUsername, normalizedGuildId) ?? null;
-    }
+    return this.db.prepare(`
+      SELECT *
+      FROM watch_subscriptions
+      WHERE platform = ? AND username = ? AND guild_id = ?
+    `).get(normalizedPlatform, normalizedUsername, normalizedGuildId) ?? null;
   }
 
   hasWatchSubscription(username, scope = {}) {
@@ -1278,39 +1165,13 @@ export class Store {
 
   listWatchSubscriptions(username, platform = null) {
     const normalizedUsername = String(username ?? '').trim();
-    if (platform) {
-      const normalizedPlatform = normalizePlatform(platform);
-      try {
-        return this.db.prepare(`
-          SELECT *
-          FROM watch_subscriptions
-          WHERE platform = ? AND username = ?
-          ORDER BY guild_id, created_at, id
-        `).all(normalizedPlatform, normalizedUsername);
-      } catch {
-        return this.db.prepare(`
-          SELECT *
-          FROM watch_subscriptions
-          WHERE username = ?
-          ORDER BY guild_id, created_at, id
-        `).all(normalizedUsername).filter((r) => (r.platform ?? 'tiktok') === normalizedPlatform);
-      }
-    }
-    try {
-      return this.db.prepare(`
-        SELECT *
-        FROM watch_subscriptions
-        WHERE username = ?
-        ORDER BY platform, guild_id, created_at, id
-      `).all(normalizedUsername);
-    } catch {
-      return this.db.prepare(`
-        SELECT *
-        FROM watch_subscriptions
-        WHERE username = ?
-        ORDER BY guild_id, created_at, id
-      `).all(normalizedUsername);
-    }
+    return this.db.prepare(`
+      SELECT *
+      FROM watch_subscriptions
+      WHERE username = ?
+        ${platform ? 'AND platform = ?' : ''}
+      ORDER BY platform, guild_id, created_at, id
+    `).all(normalizedUsername, ...(platform ? [normalizePlatform(platform)] : []));
   }
 
   getAlertDelivery({ videoId, subscriptionId, eventType = 'new_post' } = {}) {
@@ -1387,6 +1248,7 @@ export class Store {
 
   recordMonitorDownloadFailure({
     videoId,
+    platform = '',
     username = '',
     sourceUrl = '',
     title = '',
@@ -1413,12 +1275,13 @@ export class Store {
         : null;
       this.db.prepare(`
         INSERT INTO monitor_download_failures (
-          video_id, username, source_url, title, media_type, status,
+          video_id, platform, username, source_url, title, media_type, status,
           failure_count, retry_count, first_failed_at, last_failed_at,
           last_error, dead_lettered_at, last_retry_at, resolved_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
         ON CONFLICT(video_id) DO UPDATE SET
+          platform = excluded.platform,
           username = excluded.username,
           source_url = excluded.source_url,
           title = excluded.title,
@@ -1432,6 +1295,7 @@ export class Store {
           updated_at = excluded.updated_at
       `).run(
         id,
+        normalizePlatform(platform || existing?.platform || 'tiktok'),
         String(username || existing?.username || ''),
         String(sourceUrl || existing?.source_url || ''),
         String(title || existing?.title || ''),
@@ -1815,82 +1679,45 @@ export class Store {
     `).all(Math.max(1, Math.min(100, Number(limit) || 25)));
   }
 
-  markWatchSuccess(username, now = Date.now(), nextCheckAt = null) {
+  markWatchSuccess(username, now = Date.now(), nextCheckAt = null, platform = 'tiktok') {
     const normalizedUsername = String(username ?? '').trim();
-    try {
-      const watch = this.db.prepare('SELECT platform FROM watched_users WHERE username = ? LIMIT 1').get(normalizedUsername);
-      if (watch?.platform) {
-        this.db.prepare(`
-          UPDATE watched_users
-          SET last_checked_at = ?, last_success_at = ?, failure_count = 0, last_error = NULL, next_check_at = ?
-          WHERE platform = ? AND username = ?
-        `).run(now, now, nextCheckAt, watch.platform, normalizedUsername);
-        return;
-      }
-    } catch {}
-
+    const normalizedPlatform = normalizePlatform(platform);
     this.db.prepare(`
       UPDATE watched_users
       SET last_checked_at = ?, last_success_at = ?, failure_count = 0, last_error = NULL, next_check_at = ?
-      WHERE username = ?
-    `).run(now, now, nextCheckAt, username);
+      WHERE platform = ? AND username = ?
+    `).run(now, now, nextCheckAt, normalizedPlatform, normalizedUsername);
   }
 
-  markWatchFailure(username, error, nextCheckAt, now = Date.now()) {
+  markWatchFailure(username, error, nextCheckAt, now = Date.now(), platform = 'tiktok') {
     const normalizedUsername = String(username ?? '').trim();
-    try {
-      const watch = this.db.prepare('SELECT platform FROM watched_users WHERE username = ? LIMIT 1').get(normalizedUsername);
-      if (watch?.platform) {
-        this.db.prepare(`
-          UPDATE watched_users
-          SET last_checked_at = ?, failure_count = failure_count + 1, last_error = ?, next_check_at = ?
-          WHERE platform = ? AND username = ?
-        `).run(now, String(error).slice(0, 500), nextCheckAt, watch.platform, normalizedUsername);
-        return;
-      }
-    } catch {}
-
+    const normalizedPlatform = normalizePlatform(platform);
     this.db.prepare(`
       UPDATE watched_users
       SET last_checked_at = ?, failure_count = failure_count + 1, last_error = ?, next_check_at = ?
-      WHERE username = ?
-    `).run(now, String(error).slice(0, 500), nextCheckAt, username);
+      WHERE platform = ? AND username = ?
+    `).run(now, String(error).slice(0, 500), nextCheckAt, normalizedPlatform, normalizedUsername);
   }
+
   markHighlightCheckSuccess(username, platform = 'instagram', now = Date.now(), nextCheckAt = null) {
     const normalizedUsername = String(username ?? '').trim();
     const normalizedPlatform = normalizePlatform(platform ?? 'instagram');
-    try {
-      this.db.prepare(`
-        UPDATE watched_users
-        SET last_highlight_check_at = ?, highlight_failure_count = 0, highlight_last_error = NULL, next_highlight_check_at = ?
-        WHERE platform = ? AND username = ?
-      `).run(now, nextCheckAt, normalizedPlatform, normalizedUsername);
-    } catch {
-      this.db.prepare(`
-        UPDATE watched_users
-        SET last_highlight_check_at = ?, highlight_failure_count = 0, highlight_last_error = NULL, next_highlight_check_at = ?
-        WHERE username = ?
-      `).run(now, nextCheckAt, normalizedUsername);
-    }
+    this.db.prepare(`
+      UPDATE watched_users
+      SET last_highlight_check_at = ?, highlight_failure_count = 0, highlight_last_error = NULL, next_highlight_check_at = ?
+      WHERE platform = ? AND username = ?
+    `).run(now, nextCheckAt, normalizedPlatform, normalizedUsername);
   }
 
   markHighlightCheckFailure(username, platform = 'instagram', error = '', nextCheckAt = null, now = Date.now()) {
     const normalizedUsername = String(username ?? '').trim();
     const normalizedPlatform = normalizePlatform(platform ?? 'instagram');
     const lastError = String(error?.message ?? error ?? '').slice(0, 500);
-    try {
-      this.db.prepare(`
-        UPDATE watched_users
-        SET last_highlight_check_at = ?, highlight_failure_count = highlight_failure_count + 1, highlight_last_error = ?, next_highlight_check_at = ?
-        WHERE platform = ? AND username = ?
-      `).run(now, lastError, nextCheckAt, normalizedPlatform, normalizedUsername);
-    } catch {
-      this.db.prepare(`
-        UPDATE watched_users
-        SET last_highlight_check_at = ?, highlight_failure_count = highlight_failure_count + 1, highlight_last_error = ?, next_highlight_check_at = ?
-        WHERE username = ?
-      `).run(now, lastError, nextCheckAt, normalizedUsername);
-    }
+    this.db.prepare(`
+      UPDATE watched_users
+      SET last_highlight_check_at = ?, highlight_failure_count = highlight_failure_count + 1, highlight_last_error = ?, next_highlight_check_at = ?
+      WHERE platform = ? AND username = ?
+    `).run(now, lastError, nextCheckAt, normalizedPlatform, normalizedUsername);
   }
 
 
