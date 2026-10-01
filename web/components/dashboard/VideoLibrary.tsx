@@ -299,12 +299,12 @@ export function VideoLibrary({
         role="tabpanel"
         aria-labelledby="video-library-active-tab"
       >
-        <div className={styles.tableHeader} role="row">
-          <span role="columnheader">Video</span>
-          <span className={styles.tableMetadataHeader} role="presentation">
-            <span role="columnheader">Creator</span>
-            <span role="columnheader">Saved</span>
-            <span role="columnheader" aria-sort={sizeSort === null ? "none" : sizeSort === "asc" ? "ascending" : "descending"}>
+        <div className={styles.tableHeader}>
+          <span>Video</span>
+          <span className={styles.tableMetadataHeader}>
+            <span>Creator</span>
+            <span>Saved</span>
+            <span>
               <button
                 className={styles.sortHeaderButton}
                 type="button"
@@ -316,7 +316,7 @@ export function VideoLibrary({
               </button>
             </span>
           </span>
-          <span role="columnheader"><span className="sr-only">Actions</span></span>
+          <span><span className="sr-only">Actions</span></span>
         </div>
         <div className={styles.videoList} role="list" aria-label="Saved videos">
           {filtered.map((video) => (
