@@ -214,7 +214,7 @@
   padding: 4px 6px;
   background: rgba(0, 0, 0, 0.76);
   color: white;
-  font-family: var(--font-geist-mono), monospace;
+  font-family: ui-monospace, monospace;
   font-size: 10px;
   font-weight: 650;
   line-height: 1;

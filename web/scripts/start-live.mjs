@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { isBridgeRequestPath } from "./start-live-core.mjs";
+import { isBridgeRequestPath, proxyRequest } from "./start-live-core.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const projectDir = path.resolve(here, "..");
@@ -29,38 +29,6 @@ gateway.listen(gatewayPort, "0.0.0.0", () => {
 
 for (const signal of ["SIGINT", "SIGTERM"]) {
   process.on(signal, () => stop(signal));
-}
-
-function proxyRequest(request, response, targetPort) {
-  const forwardedFor = [request.headers["x-forwarded-for"], request.socket.remoteAddress]
-    .filter(Boolean)
-    .join(", ");
-  const headers = {
-    ...request.headers,
-    host: request.headers.host,
-    "x-forwarded-for": forwardedFor,
-    "x-forwarded-host": request.headers.host || "",
-    "x-forwarded-proto": request.headers["x-forwarded-proto"] || "http",
-  };
-  const upstream = http.request({
-    host: "127.0.0.1",
-    port: targetPort,
-    method: request.method,
-    path: request.url,
-    headers,
-  }, (upstreamResponse) => {
-    response.writeHead(upstreamResponse.statusCode || 502, upstreamResponse.headers);
-    upstreamResponse.pipe(response);
-  });
-  upstream.on("error", (error) => {
-    if (response.headersSent) {
-      response.destroy(error);
-      return;
-    }
-    response.writeHead(502, { "content-type": "application/json; charset=utf-8" });
-    response.end(JSON.stringify({ error: "Rewind service is starting" }));
-  });
-  request.pipe(upstream);
 }
 
 function start(command, args) {

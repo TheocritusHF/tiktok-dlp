@@ -158,6 +158,22 @@ test("active cache files remain protected until every serving stream releases th
   assert.deepEqual([...tracker.protectedNames()], []);
 });
 
+test("prepared playback copies outlive the age limit but still obey size and active-file bounds", () => {
+  const oldCopy = `playback-v1-${"a".repeat(32)}.mp4`;
+  const recentCopy = `playback-v1-${"b".repeat(32)}.mp4`;
+  const activeCopy = `playback-v1-${"c".repeat(32)}.mp4`;
+  const entries = [
+    { name: "thumb-1.jpg", size: 2, mtimeMs: 1, isFile: true },
+    { name: oldCopy, size: 6, mtimeMs: 1, isFile: true },
+    { name: recentCopy, size: 4, mtimeMs: 900_000, isFile: true },
+    { name: activeCopy, size: 5, mtimeMs: 1, isFile: true },
+    { name: `${oldCopy}.part-123`, size: 50, mtimeMs: 1, isFile: true },
+  ];
+  const policy = { now: 1_000_000, maxAgeMs: 500_000, protectedNames: new Set([activeCopy]) };
+  assert.deepEqual(selectCacheEntriesForEviction(entries, { ...policy, maxBytes: 15 }), ["thumb-1.jpg"]);
+  assert.deepEqual(selectCacheEntriesForEviction(entries, { ...policy, maxBytes: 9 }), ["thumb-1.jpg", oldCopy]);
+});
+
 test("thumbnail validators use HTTP weak comparison, lists, and wildcards", () => {
   const etag = '"42-100-9000"';
   assert.equal(matchesIfNoneMatch(etag, etag), true);
