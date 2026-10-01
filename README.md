@@ -592,7 +592,8 @@ to roll production backward if a newer commit is already deployed.
 Register the runner under repo **Settings → Actions → Runners**. Add the label
 `yufeihl` and use a work directory outside the production checkout, for example
 `~/actions-runner`. Keep `.env`, cookies, `data/`, and `.secrets/` on the host;
-they are not in git.
+they are not in git. The workflow sets up Node.js 22 for host-side backup tools;
+it does not depend on an interactive shell loading nvm.
 
 ## Operational notes
 

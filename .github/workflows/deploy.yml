@@ -30,6 +30,11 @@ jobs:
       run:
         shell: bash
     steps:
+      - name: Set up Node.js for deployment tools
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Verify production checkout
         run: |
           set -euo pipefail
