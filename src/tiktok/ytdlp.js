@@ -139,8 +139,11 @@ export async function listProfileVideos(usernameOrUrl, options = {}) {
     flatPlaylist: true,
   });
 
+  const username = resolvePlaylistUsername(
+    options.username, options.watch?.username, extractUsernameFromUrl(usernameOrUrl), usernameOrUrl,
+  );
   const entries = Array.isArray(raw.entries)
-    ? raw.entries.map((entry, index) => normalizePlaylistEntry(entry, sourceUrl, index))
+    ? raw.entries.map((entry, index) => normalizePlaylistEntry(entry, sourceUrl, index, { username }))
     : [];
   const metadata = normalizeMetadata(raw, sourceUrl);
   if (cachedSecUid && !metadata.secUid) metadata.secUid = cachedSecUid;
@@ -626,7 +629,7 @@ function normalizePlaylistEntry(entry, sourceUrl, index, defaults = {}) {
   const raw = entry && typeof entry === 'object' ? entry : {};
   const mediaType = resolveMediaType({ ...defaults, ...raw }, raw.webpage_url ?? raw.original_url ?? raw.url ?? sourceUrl);
   const videoId = String(raw.id ?? extractIdFromEntryUrl(raw.url) ?? '');
-  const videoUrl = resolvePlaylistEntryUrl(raw, sourceUrl, mediaType, videoId);
+  const videoUrl = resolvePlaylistEntryUrl(raw, sourceUrl, mediaType, videoId, defaults.username);
   return {
     ...raw,
     id: videoId,
@@ -642,25 +645,27 @@ function normalizePlaylistEntry(entry, sourceUrl, index, defaults = {}) {
   };
 }
 
-function resolvePlaylistEntryUrl(entry = {}, sourceUrl = '', mediaType = '', videoId = '') {
+function resolvePlaylistUsername(...values) {
+  return values.map((value) => String(value ?? '').trim().replace(/^@/, ''))
+    .find((value) => /^[a-zA-Z0-9_.]{1,24}$/.test(value) && !value.endsWith('.')) ?? '';
+}
+
+function resolvePlaylistEntryUrl(entry = {}, sourceUrl = '', mediaType = '', videoId = '', knownUsername = '') {
+  const username = resolvePlaylistUsername(
+    entry.uploader, entry.channel, entry.creator, entry.username,
+    extractUsernameFromUrl(entry.uploader_url), knownUsername, extractUsernameFromUrl(sourceUrl),
+  );
+  if (username && /^\d+$/.test(videoId)) {
+    const kind = mediaType === 'story' ? 'story' : mediaType === 'slideshow' ? 'photo' : 'video';
+    return `https://www.tiktok.com/@${username}/${kind}/${videoId}`;
+  }
+
   for (const value of [entry.webpage_url, entry.original_url, entry.url]) {
     const text = String(value ?? '');
     if (/^https?:\/\//i.test(text)) return text;
   }
 
-  const username = String(
-    entry.uploader
-      ?? entry.channel
-      ?? entry.creator
-      ?? extractUsernameFromUrl(sourceUrl)
-      ?? '',
-  );
-  if (username && videoId) {
-    const kind = mediaType === 'story' ? 'story' : 'video';
-    return `https://www.tiktok.com/@${username}/${kind}/${videoId}`;
-  }
-
-  return String(sourceUrl ?? '');
+  return /^https?:\/\//i.test(sourceUrl) ? String(sourceUrl) : '';
 }
 
 function extractUsernameFromUrl(sourceUrl = '') {
