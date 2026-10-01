@@ -200,7 +200,7 @@ export async function listProfileStories(usernameOrUrl, options = {}) {
     ? raw.itemList.map((entry, index) => normalizeStoryEntry(entry, {
         ...profile,
         sourceUrl: storySourceUrl,
-      }, index)).filter((entry) => entry.videoId && entry.directVideoUrl)
+      }, index)).filter((entry) => entry.videoId && (entry.directVideoUrl || entry.imageUrls.length))
     : [];
   const hasStory = entries.length > 0;
 
@@ -827,7 +827,6 @@ function normalizeStoryEntry(item, profile = {}, index = 0) {
   const video = raw.video && typeof raw.video === 'object' ? raw.video : {};
   const id = String(raw.id ?? video.id ?? video.videoID ?? '');
   const username = String(raw.author?.uniqueId ?? profile.username ?? '');
-  const storyPageUrl = username && id ? `https://www.tiktok.com/@${username}/story/${id}` : String(profile.sourceUrl ?? '');
   const directVideoUrl = firstString(
     video.playAddr,
     video.downloadAddr,
@@ -835,6 +834,18 @@ function normalizeStoryEntry(item, profile = {}, index = 0) {
     video.PlayAddrStruct?.urlList,
     video.bitRateInfo?.map((entry) => entry?.PlayAddr?.UrlList ?? entry?.PlayAddr?.urlList),
   );
+  const images = raw.imagePost?.images ?? raw.image_post_info?.images;
+  const imageUrls = Array.isArray(images)
+    ? images.map((image) => firstString(
+        image?.imageURL?.urlList,
+        image?.image_url?.url_list,
+        image?.display_image?.url_list,
+        image?.downloadURL?.urlList,
+        image?.download_url?.url_list,
+      )).filter(Boolean)
+    : [];
+  const kind = !directVideoUrl && imageUrls.length ? 'photo' : 'story';
+  const storyPageUrl = username && id ? `https://www.tiktok.com/@${username}/${kind}/${id}` : String(profile.sourceUrl ?? '');
   const dataSize = numberOrNull(video.PlayAddrStruct?.DataSize ?? video.size ?? video.dataSize) ?? 0;
   return {
     id,
@@ -850,6 +861,7 @@ function normalizeStoryEntry(item, profile = {}, index = 0) {
     username,
     mediaType: 'story',
     directVideoUrl,
+    imageUrls,
     timestamp: numberOrNull(raw.createTime) ?? 0,
     duration: numberOrNull(video.duration) ?? 0,
     thumbnail: firstString(video.cover, video.dynamicCover, video.originCover) || '',
@@ -1002,7 +1014,7 @@ async function downloadPhotoPost(sourceUrl, metadata, tempDir, options = {}) {
     title: normalized.title || '',
     description: normalized.description || '',
     thumbnailUrl: normalized.thumbnail || '',
-    mediaType: 'slideshow',
+    mediaType: normalized.mediaType === 'story' ? 'story' : 'slideshow',
     imageCount: imageEntries.length,
     slideshowImagePaths,
     duration: 0,
@@ -1258,7 +1270,7 @@ function shouldTryPhotoFallback(sourceUrl, error, options = {}) {
 }
 
 function isPhotoPostMetadata(metadata) {
-  return metadata?.mediaType === 'slideshow'
+  return (metadata?.mediaType === 'slideshow' || (metadata?.mediaType === 'story' && !isStoryMetadata(metadata)))
     && Array.isArray(metadata?.imageUrls)
     && metadata.imageUrls.length > 0;
 }

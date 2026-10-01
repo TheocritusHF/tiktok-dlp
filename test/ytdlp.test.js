@@ -1,4 +1,4 @@
-import { mkdtemp, chmod, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { mkdtemp, chmod, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { spawn as defaultSpawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
@@ -256,6 +256,70 @@ test('fetchVideoMetadata, listProfileVideos, and downloadVideo work with a fake 
   assert.equal(path.basename(movedDownload.primaryFile), 'downloaded.mp4');
   assert.ok(movedDownload.primaryFile.startsWith(finalRoot));
   assert.equal(path.relative(finalRoot, movedDownload.primaryFile).startsWith('.tmp'), false);
+});
+
+test('mixed video and photo Stories list and download as Stories', async (t) => {
+  const imageUrls = ['https://cdn.example.test/first.jpg', 'https://cdn.example.test/second.jpg'];
+  const imageShapes = {
+    imagePost: { imagePost: { images: imageUrls.map((url) => ({ imageURL: { urlList: [url] } })) } },
+    legacyImageUrl: { image_post_info: { images: imageUrls.map((url) => ({ image_url: { url_list: [url] } })) } },
+    legacyDisplayImage: { image_post_info: { images: imageUrls.map((url) => ({ display_image: { url_list: [url] } })) } },
+  };
+  const root = await mkdtemp(path.join(os.tmpdir(), 'tiktok-photo-stories-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+
+  for (const [shape, images] of Object.entries(imageShapes)) {
+    await t.test(shape, async () => {
+      const storyFetch = createStoryFetch();
+      const photoFetch = createPhotoFetch();
+      const fetchImpl = async (url, init) => {
+        if (imageUrls.includes(String(url))) return photoFetch(url, init);
+        const response = await storyFetch(url, init);
+        if (String(url).includes('/api/story/item_list/')) {
+          const payload = await response.json();
+          payload.itemList.push(
+            { id: '4444444444', author: { uniqueId: 'creator' }, ...images },
+            { id: '5555555555' },
+            { ...images },
+          );
+          return { ...response, json: async () => payload };
+        }
+        return response;
+      };
+      const stories = await listProfileStories('creator', { fetchImpl, limit: 2 });
+      assert.equal(stories.count, 2);
+      const [video, photo] = stories.entries;
+      assert.equal(video.url, 'https://www.tiktok.com/@creator/story/3333333333');
+      assert.equal(video.directVideoUrl, 'https://cdn.example.test/story.mp4');
+      assert.equal(photo.videoId, '4444444444');
+      assert.equal(photo.url, 'https://www.tiktok.com/@creator/photo/4444444444');
+      assert.deepEqual(photo.imageUrls, imageUrls);
+      assert.equal(photo.mediaType, 'story');
+      assert.equal(photo.directVideoUrl, '');
+
+      const download = await downloadVideo(photo.url, {
+        metadata: photo,
+        fetchImpl,
+        downloadDir: path.join(root, shape),
+        keepSlideshowImages: true,
+      });
+      assert.equal(download.mediaType, 'story');
+      assert.equal(download.metadata.mediaType, 'story');
+      assert.equal(download.imageCount, 2);
+      assert.equal(path.extname(download.primaryFile), '.zip');
+      const archive = await readFile(download.primaryFile);
+      assert.equal(archive.subarray(0, 4).toString('hex'), '504b0304');
+      for (const content of ['001.jpg', '002.jpg', 'manifest.json', ...imageUrls.map((url) => `image:${url}`)]) {
+        assert.ok(archive.includes(Buffer.from(content)));
+      }
+      assert.deepEqual(
+        await Promise.all(download.slideshowImagePaths.map(async (file) => (await readFile(file)).toString())),
+        imageUrls.map((url) => `image:${url}`),
+      );
+      const infoPath = download.files.find((file) => file.endsWith('.info.json'));
+      assert.equal(JSON.parse(await readFile(infoPath, 'utf8')).mediaType, 'story');
+    });
+  }
 });
 
 test('profile listings canonicalize cached secUid URLs and preserve fallback URLs', async (t) => {
