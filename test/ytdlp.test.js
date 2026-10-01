@@ -258,6 +258,30 @@ test('fetchVideoMetadata, listProfileVideos, and downloadVideo work with a fake 
   assert.equal(path.relative(finalRoot, movedDownload.primaryFile).startsWith('.tmp'), false);
 });
 
+test('photo stories are listed, downloaded as images, and remain classified as stories', async () => {
+  const storyFetch = createStoryFetch({ photoItems: true });
+  const stories = await listProfileStories('creator', { fetchImpl: storyFetch, limit: 2 });
+  assert.equal(stories.count, 2);
+  const photo = stories.entries.find((entry) => entry.videoId === '4444444444');
+  assert.equal(photo.url, 'https://www.tiktok.com/@creator/photo/4444444444');
+  assert.equal(photo.mediaType, 'story');
+  assert.deepEqual(photo.imageUrls, ['https://cdn.example.test/story-photo.jpg']);
+
+  const root = await mkdtemp(path.join(os.tmpdir(), 'tiktok-photo-story-'));
+  const result = await downloadVideo(photo.url, {
+    metadata: photo,
+    fetchImpl: storyFetch,
+    ytdlpPath: '/nonexistent/yt-dlp',
+    downloadDir: root,
+    keepSlideshowImages: true,
+  });
+  assert.equal(result.mediaType, 'story');
+  assert.equal(result.imageCount, 1);
+  assert.equal(result.slideshowImagePaths.length, 1);
+  assert.equal((await readFile(result.slideshowImagePaths[0])).toString(), 'fake story photo');
+  assert.equal((await readFile(result.primaryFile)).subarray(0, 4).toString('hex'), '504b0304');
+});
+
 test('flat TikTok playlists use the known creator and post ID for download URLs', async () => {
   const fake = await createFakeYtDlp([
     { id: '7311111111111111111', url: '7311111111111111111' },
@@ -922,7 +946,7 @@ function createPhotoFetch(calls = []) {
   };
 }
 
-function createStoryFetch({ userStoryStatus = 1, hasItems = true } = {}) {
+function createStoryFetch({ userStoryStatus = 1, hasItems = true, photoItems = false } = {}) {
   const fetchImpl = async (url, init = {}) => {
     const textUrl = String(url);
     fetchImpl.calls.push({ url: textUrl, init });
@@ -953,6 +977,14 @@ function createStoryFetch({ userStoryStatus = 1, hasItems = true } = {}) {
                 },
               },
             },
+            ...(photoItems ? [{
+              id: '4444444444',
+              desc: 'Photo Story',
+              author: { uniqueId: 'creator' },
+              imagePost: {
+                images: [{ imageURL: { urlList: ['https://cdn.example.test/story-photo.jpg'] } }],
+              },
+            }] : []),
           ]
         : [];
       return {
@@ -975,6 +1007,17 @@ function createStoryFetch({ userStoryStatus = 1, hasItems = true } = {}) {
         url: textUrl,
         headers: { get: () => 'video/mp4' },
         arrayBuffer: async () => video.buffer.slice(video.byteOffset, video.byteOffset + video.byteLength),
+      };
+    }
+
+    if (textUrl === 'https://cdn.example.test/story-photo.jpg') {
+      const image = Buffer.from('fake story photo');
+      return {
+        ok: true,
+        status: 200,
+        url: textUrl,
+        headers: { get: () => 'image/jpeg' },
+        arrayBuffer: async () => image.buffer.slice(image.byteOffset, image.byteOffset + image.byteLength),
       };
     }
 

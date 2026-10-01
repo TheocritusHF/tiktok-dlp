@@ -1,9 +1,10 @@
 # Combined fork preview
 
-This branch combines the proposed changes from six upstream pull requests in
-one installable checkout. It is an integration preview, not a tagged release
-or an upstream release. The fork's default `main` remains a documentation-only
-overview of these proposals.
+This branch combines the proposed changes from seven upstream pull requests in
+one installable checkout. The current prerelease snapshot is
+[`v0.1.0-preview.2`](https://github.com/TheocritusHF/tiktok-dlp/releases/tag/v0.1.0-preview.2);
+this is a fork preview, not an upstream release. The fork's default `main`
+remains a documentation-only overview of these proposals.
 
 | Area | Upstream proposal | Enabled by default? |
 | --- | --- | --- |
@@ -13,6 +14,7 @@ overview of these proposals.
 | Separate Discord archive and upgrade channels | [#26](https://github.com/nqrwhal/tiktok-dlp/pull/26) | Unset |
 | Canonical monitored TikTok URLs | [#27](https://github.com/nqrwhal/tiktok-dlp/pull/27) | Yes; no setting |
 | Webcast LIVE fallback and bounded reconnects | [#28](https://github.com/nqrwhal/tiktok-dlp/pull/28) | No |
+| TikTok photo Story discovery and download | [#29](https://github.com/nqrwhal/tiktok-dlp/pull/29) | Yes; no setting |
 
 PR #24 builds on #23; PR #26 builds on #25; PR #28 builds on #24. This
 preview resolves those overlaps into one codebase. Upstream review of the
@@ -81,7 +83,9 @@ Each LIVE addition requires `LIVE_RECORDING_ENABLED=true`. Adaptive recording
 and reconnects preserve multiple parts rather than stitching them into one
 file. Scheduled post quality rechecks run at 6, 24, and 72 hours when enabled
 and only replace an archived video after a verified improvement. The canonical
-TikTok URL fix requires no setting. See the README's LIVE and quality sections
+TikTok URL and photo Story fixes require no setting. Photo Stories discovered
+through monitoring are archived as image ZIPs and follow the existing Story
+notification route. See the README's LIVE and quality sections
 for timing, storage, and notification behavior.
 
 ## Existing installations
@@ -94,6 +98,8 @@ project's [backup and recovery instructions](README.md#backups-and-recovery)
 when moving an existing archive. Do not point two running checkouts at the
 same SQLite database or downloads directory.
 
-This preview branch can be updated when the individual PRs change. It is not
-the upstream project's installation branch; compare its commit and release
-notes before updating an existing deployment.
+This preview branch can be updated when the individual PRs change. Use the
+`v0.1.0-preview.2` tag for a fixed snapshot; the earlier `v0.1.0-preview.1`
+tag remains at its original commit. The branch is not the upstream project's
+installation branch; compare its commit and release notes before updating an
+existing deployment.

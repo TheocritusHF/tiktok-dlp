@@ -1,10 +1,11 @@
 # tiktok-dlp
 
 > **Combined fork preview:** This branch integrates upstream proposals
-> [#23–#28](RELEASE_PREVIEW.md) for use together. See the
+> [#23–#29](RELEASE_PREVIEW.md) for use together. See the
 > [preview installation guide](RELEASE_PREVIEW.md) for setup and feature
-> settings. It is separate from the fork's default `main` and is not a tagged
-> release. Optional recording, quality, and notification features remain off
+> settings. The fixed snapshot is
+> [`v0.1.0-preview.2`](https://github.com/TheocritusHF/tiktok-dlp/releases/tag/v0.1.0-preview.2).
+> The branch is separate from the fork's default `main`. Optional recording, quality, and notification features remain off
 > until configured.
 
 Self-hosted social-media downloader and archive for TikTok, Instagram, and X,
@@ -46,7 +47,8 @@ Implementation progress and remaining work are tracked in [WORKLOG.md](WORKLOG.m
 - Handles public photo/slideshow posts with a direct fallback and ZIP output.
   Configured cookies and the yt-dlp proxy are applied to those HTTP fallbacks.
 - Performs best-effort TikTok Story discovery and downloads, including an
-  authenticated session when cookies are configured.
+  authenticated session when cookies are configured. Photo Stories are saved
+  as image ZIPs and use the existing Story notification flow.
 - Monitors creators on a per-server or per-DM subscription basis.
 - Detects creator username changes and reports when saved source posts disappear.
 - Persists repeated monitor download failures as dead letters instead of marking
