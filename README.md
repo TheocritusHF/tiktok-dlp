@@ -17,18 +17,20 @@ Implementation progress and remaining work are tracked in [WORKLOG.md](WORKLOG.m
 > [adaptive LIVE quality](https://github.com/nqrwhal/tiktok-dlp/pull/24),
 > [post quality rechecks](https://github.com/nqrwhal/tiktok-dlp/pull/25),
 > [dedicated Discord channels](https://github.com/nqrwhal/tiktok-dlp/pull/26),
-> [TikTok URL reliability](https://github.com/nqrwhal/tiktok-dlp/pull/27), and
-> [webcast fallback and reconnects](https://github.com/nqrwhal/tiktok-dlp/pull/28)
+> [TikTok URL reliability](https://github.com/nqrwhal/tiktok-dlp/pull/27),
+> [webcast fallback and reconnects](https://github.com/nqrwhal/tiktok-dlp/pull/28), and
+> [TikTok photo Stories](https://github.com/nqrwhal/tiktok-dlp/pull/29)
 > are on separate feature branches. Their code is not in this default `main`
 > branch. The [fork roadmap](FORK_ROADMAP.md) lists branches, dependencies, and
 > optional settings; the PR pages show current review status.
 
 > **Want the features together?** The
 > [combined preview branch](https://github.com/TheocritusHF/tiktok-dlp/tree/release/combined-preview)
-> contains PRs #23–#28 in one checkout. Follow its
+> contains PRs #23–#29 in one checkout. Follow its
 > [installation guide](https://github.com/TheocritusHF/tiktok-dlp/blob/release/combined-preview/RELEASE_PREVIEW.md).
-> It is an integration preview, not a tagged release.
-
+> The current fixed snapshot is
+> [`v0.1.0-preview.2`](https://github.com/TheocritusHF/tiktok-dlp/releases/tag/v0.1.0-preview.2);
+> the branch may receive later changes.
 
 > [!IMPORTANT]
 > Optional, platform-specific Netscape cookies authenticate as a real account so

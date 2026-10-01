@@ -15,6 +15,7 @@ upstream PR pages for current review and merge status.
 | Dedicated Discord archive and upgrade channels | [`feat/separate-discord-notification-channels`](https://github.com/TheocritusHF/tiktok-dlp/tree/feat/separate-discord-notification-channels) | [PR #26](https://github.com/nqrwhal/tiktok-dlp/pull/26) | Builds on #25 |
 | TikTok monitored URL reliability | [`fix/tiktok-url-reliability`](https://github.com/TheocritusHF/tiktok-dlp/tree/fix/tiktok-url-reliability) | [PR #27](https://github.com/nqrwhal/tiktok-dlp/pull/27) | Independent fix; no new setting |
 | Webcast LIVE fallback and reconnects | [`feat/webcast-live-reconnect`](https://github.com/TheocritusHF/tiktok-dlp/tree/feat/webcast-live-reconnect) | [PR #28](https://github.com/nqrwhal/tiktok-dlp/pull/28) | Builds on #24 and #23 |
+| TikTok photo Story discovery and download | [`fix/tiktok-photo-stories`](https://github.com/TheocritusHF/tiktok-dlp/tree/fix/tiktok-photo-stories) | [PR #29](https://github.com/nqrwhal/tiktok-dlp/pull/29) | Independent fix; no new setting |
 
 PR #24 includes the code from #23, PR #26 includes the code from #25, and
 PR #28 includes the code from #23 and #24. Their GitHub diffs against upstream
@@ -37,6 +38,8 @@ or [#28](https://github.com/TheocritusHF/tiktok-dlp/compare/feat/adaptive-live-q
 - #28 checks verified webcast room data if yt-dlp reports offline and can
   reconnect a cleanly ended recorder to the same LIVE room for bounded attempts.
   It archives reconnected footage as separate parts.
+- #29 discovers photo Stories in monitored profiles, saves image ZIPs, and
+  routes notifications as Stories. It needs no new setting.
 
 ## Optional settings on feature branches
 
@@ -71,18 +74,19 @@ and `.env.example` for complete setup instructions.
 | `LIVE_RECONNECT_STABLE_SECONDS` | `60` | Reset the short-reconnect count after a stable segment. | #28 |
 
 The opt-in LIVE, post-upgrade, webcast, and reconnect features are disabled
-by default; the dedicated Discord channels are unset. PR #27's URL fix has no
-new toggle. PR #28 still requires `LIVE_RECORDING_ENABLED=true` for its
+by default; the dedicated Discord channels are unset. PRs #27 and #29 have no
+new toggles. PR #28 still requires `LIVE_RECORDING_ENABLED=true` for its
 optional LIVE behaviors to run.
 
 ## Combined fork preview
 
 The [combined preview branch](https://github.com/TheocritusHF/tiktok-dlp/tree/release/combined-preview)
-contains PRs #23–#28 in one checkout, with a separate
+contains PRs #23–#29 in one checkout, with a separate
 [installation guide](https://github.com/TheocritusHF/tiktok-dlp/blob/release/combined-preview/RELEASE_PREVIEW.md).
-The integrated backend passed 259 tests and both Docker image builds. This is
-a branch preview, not a tagged release or an upstream merge. Its optional
-features remain disabled until configured. Back up an existing archive before
+The integrated backend passed 260 tests. The current fixed snapshot is
+[`v0.1.0-preview.2`](https://github.com/TheocritusHF/tiktok-dlp/releases/tag/v0.1.0-preview.2);
+the earlier `.1` snapshot remains at its original commit. This is a fork preview,
+not an upstream merge. Its optional features remain disabled until configured. Back up an existing archive before
 upgrading, since #25 adds a SQLite migration.
 
 The fork's default `main` still contains only the overview and roadmap, not
