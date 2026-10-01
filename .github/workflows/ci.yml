@@ -81,7 +81,7 @@ jobs:
 
   browser:
     name: Rewind Chromium workflows
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: web
     timeout-minutes: 20
     defaults:
