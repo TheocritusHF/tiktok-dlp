@@ -626,7 +626,13 @@ to roll production backward if a newer commit is already deployed.
 Register the runner under repo **Settings → Actions → Runners**. Add the label
 `yufeihl` and use a work directory outside the production checkout, for example
 `~/actions-runner`. Keep `.env`, cookies, `data/`, and `.secrets/` on the host;
-they are not in git.
+they are not in git. Deployment uses a clean checkout at
+`/home/yufei/tiktok-dlp-production`, with `.env`, `.secrets`, `cookies`, and `data`
+linked to the existing runtime paths in `/home/yufei/tiktok-discord-downloader`.
+The fixed Compose project name `tiktok-discord-downloader` preserves the existing
+containers, network, and cache volume. Develop in the original checkout; only
+committed `main` revisions deploy. The workflow sets up Node.js 22 for host-side backup tools;
+it does not depend on an interactive shell loading nvm.
 
 ## Operational notes
 

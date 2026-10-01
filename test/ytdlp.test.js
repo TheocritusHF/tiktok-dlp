@@ -544,40 +544,105 @@ test('native yt-dlp reuses info formats and refreshes expired URLs without a cus
   }
 });
 
-test('secUid profile listings rewrite entry URLs to the human handle', async () => {
-  const dir = await mkdtemp(path.join(os.tmpdir(), 'fake-ytdlp-secid-'));
-  const scriptPath = path.join(dir, 'yt-dlp');
-  const script = `#!/usr/bin/env node
-const args = process.argv.slice(2);
-const sourceUrl = args[args.length - 1] || '';
-const secUid = sourceUrl.startsWith('tiktokuser:') ? sourceUrl.slice('tiktokuser:'.length) : 'creator';
-process.stdout.write(JSON.stringify({
-  _type: 'playlist',
-  id: secUid,
-  entries: [
-    { id: '111', title: 'First', uploader: 'creator', uploader_url: 'https://www.tiktok.com/@creator', uploader_id: '424242424242', channel_id: secUid, webpage_url: 'https://www.tiktok.com/@' + secUid + '/video/111' },
-    { id: '222', title: 'Second', uploader_id: '424242424242', channel_id: secUid, webpage_url: 'https://www.tiktok.com/@' + secUid + '/video/222' },
-  ],
-}));
-process.exit(0);
-`;
-  await writeFile(scriptPath, script, { mode: 0o755 });
-  await chmod(scriptPath, 0o755);
+test('mixed video and photo Stories list and download as Stories', async (t) => {
+  const imageUrls = ['https://cdn.example.test/first.jpg', 'https://cdn.example.test/second.jpg'];
+  const imageShapes = {
+    imagePost: { imagePost: { images: imageUrls.map((url) => ({ imageURL: { urlList: [url] } })) } },
+    legacyImageUrl: { image_post_info: { images: imageUrls.map((url) => ({ image_url: { url_list: [url] } })) } },
+    legacyDisplayImage: { image_post_info: { images: imageUrls.map((url) => ({ display_image: { url_list: [url] } })) } },
+  };
+  const root = await mkdtemp(path.join(os.tmpdir(), 'tiktok-photo-stories-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
 
-  const profile = await listProfileVideos('https://www.tiktok.com/@creator', {
-    ytdlpPath: scriptPath,
-    username: 'creator',
-    watch: { sec_uid: TEST_SEC_UID },
-  });
-  assert.equal(profile.entries.length, 2);
-  // Human handle available: rewritten to the canonical human URL.
-  assert.equal(profile.entries[0].webpage_url, 'https://www.tiktok.com/@creator/video/111');
-  assert.equal(profile.entries[0].url, 'https://www.tiktok.com/@creator/video/111');
-  // No human handle available: secUid URL preserved (still downloadable).
-  assert.equal(
-    profile.entries[1].webpage_url,
-    `https://www.tiktok.com/@${TEST_SEC_UID}/video/222`,
-  );
+  for (const [shape, images] of Object.entries(imageShapes)) {
+    await t.test(shape, async () => {
+      const storyFetch = createStoryFetch();
+      const photoFetch = createPhotoFetch();
+      const fetchImpl = async (url, init) => {
+        if (imageUrls.includes(String(url))) return photoFetch(url, init);
+        const response = await storyFetch(url, init);
+        if (String(url).includes('/api/story/item_list/')) {
+          const payload = await response.json();
+          payload.itemList.push(
+            { id: '4444444444', author: { uniqueId: 'creator' }, ...images },
+            { id: '5555555555' },
+            { ...images },
+          );
+          return { ...response, json: async () => payload };
+        }
+        return response;
+      };
+      const stories = await listProfileStories('creator', { fetchImpl, limit: 2 });
+      assert.equal(stories.count, 2);
+      const [video, photo] = stories.entries;
+      assert.equal(video.url, 'https://www.tiktok.com/@creator/story/3333333333');
+      assert.equal(video.directVideoUrl, 'https://cdn.example.test/story.mp4');
+      assert.equal(photo.videoId, '4444444444');
+      assert.equal(photo.url, 'https://www.tiktok.com/@creator/photo/4444444444');
+      assert.deepEqual(photo.imageUrls, imageUrls);
+      assert.equal(photo.mediaType, 'story');
+      assert.equal(photo.directVideoUrl, '');
+
+      const download = await downloadVideo(photo.url, {
+        metadata: photo,
+        fetchImpl,
+        downloadDir: path.join(root, shape),
+        keepSlideshowImages: true,
+      });
+      assert.equal(download.mediaType, 'story');
+      assert.equal(download.metadata.mediaType, 'story');
+      assert.equal(download.imageCount, 2);
+      assert.equal(path.extname(download.primaryFile), '.zip');
+      const archive = await readFile(download.primaryFile);
+      assert.equal(archive.subarray(0, 4).toString('hex'), '504b0304');
+      for (const content of ['001.jpg', '002.jpg', 'manifest.json', ...imageUrls.map((url) => `image:${url}`)]) {
+        assert.ok(archive.includes(Buffer.from(content)));
+      }
+      assert.deepEqual(
+        await Promise.all(download.slideshowImagePaths.map(async (file) => (await readFile(file)).toString())),
+        imageUrls.map((url) => `image:${url}`),
+      );
+      const infoPath = download.files.find((file) => file.endsWith('.info.json'));
+      assert.equal(JSON.parse(await readFile(infoPath, 'utf8')).mediaType, 'story');
+    });
+  }
+});
+
+test('profile listings canonicalize cached secUid URLs and preserve fallback URLs', async (t) => {
+  const id = '7688708922114444596';
+  const badUrl = `https://www.tiktok.com/@${TEST_SEC_UID}/video/${id}`;
+  const cases = [
+    { name: 'cached secUid with entry username', entry: { channel: 'creator', webpage_url: badUrl }, username: 'creator' },
+    { name: 'options username with bare id', entry: { id: undefined, url: id }, options: { username: 'creator' }, username: 'creator' },
+    { name: 'watch username', entry: { url: badUrl }, options: { watch: { username: 'creator', sec_uid: TEST_SEC_UID } }, username: 'creator' },
+    { name: 'profile URL username with cached secUid', input: 'https://www.tiktok.com/@creator', entry: { url: id }, username: 'creator' },
+    { name: 'plain profile username with cached secUid', input: 'creator', entry: { url: id }, username: 'creator' },
+    { name: 'direct profile', input: 'https://www.tiktok.com/@creator', options: { secUid: '' }, entry: { url: id }, username: 'creator' },
+    { name: 'photo kind', entry: { uploader: 'creator', webpage_url: badUrl.replace('/video/', '/photo/') }, username: 'creator', kind: 'photo' },
+    { name: 'story kind', entry: { uploader: 'creator', mediaType: 'story', url: badUrl }, username: 'creator', kind: 'story' },
+    { name: 'renamed entry wins', input: 'https://www.tiktok.com/@old_name', options: { username: 'old_name' }, entry: { uploader: 'new_name', url: badUrl }, username: 'new_name' },
+    { name: 'invalid display name skips to channel', entry: { uploader: 'Display Name!', channel: 'creator', url: badUrl }, username: 'creator' },
+    { name: 'empty fields skip to entry username', entry: { uploader: '', channel: '', username: 'creator', url: id }, username: 'creator' },
+    { name: 'uploader profile URL', entry: { uploader_url: 'https://www.tiktok.com/@creator', url: id }, username: 'creator' },
+    { name: 'secUid is not a username', entry: { uploader: TEST_SEC_UID, url: id }, expected: '' },
+    { name: 'absolute fallback without username', entry: { webpage_url: `https://www.tiktok.com/t/example/` }, expected: 'https://www.tiktok.com/t/example/' },
+    { name: 'lookup string is not a fallback', entry: { url: id }, expected: '' },
+    { name: 'nonnumeric id cannot form canonical URL', entry: { id: 'invalid', uploader: 'creator', url: badUrl }, expected: badUrl },
+  ];
+  for (const scenario of cases) {
+    await t.test(scenario.name, async () => {
+      const fake = await createFakeYtDlp({ entries: [{ id, ...scenario.entry }] });
+      const result = await listProfileVideos(scenario.input ?? '', {
+        ytdlpPath: fake,
+        secUid: TEST_SEC_UID,
+        ...scenario.options,
+      });
+      const expected = scenario.expected ?? `https://www.tiktok.com/@${scenario.username}/${scenario.kind ?? 'video'}/${id}`;
+      assert.equal(result.entries[0].videoUrl, expected);
+      assert.equal(result.entries[0].url, expected);
+      assert.equal(result.entries[0].webpage_url, expected);
+    });
+  }
 });
 
 test('photo post fallback parses and packages slideshow images', async () => {
@@ -1055,7 +1120,7 @@ test('yt-dlp gets --impersonate chrome and a writable cookies copy, not the moun
   assert.equal(captured[0].env.HTTPS_PROXY, 'http://proxy.test:8888');
 });
 
-async function createFakeYtDlp({ savedMetadata, sidecarText } = {}) {
+async function createFakeYtDlp({ savedMetadata, sidecarText, entries } = {}) {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'fake-ytdlp-'));
   const scriptPath = path.join(dir, 'yt-dlp');
   const metadataText = sidecarText ?? (savedMetadata === undefined ? undefined : JSON.stringify(savedMetadata));
@@ -1080,6 +1145,11 @@ if (has('--dump-single-json')) {
         { id: '3333333333', title: 'Story', url: '3333333333', duration: 12 },
       ],
     }));
+    process.exit(0);
+  }
+
+  if (has('--flat-playlist') && ${JSON.stringify(entries) ?? 'null'}) {
+    process.stdout.write(JSON.stringify({ entries: ${JSON.stringify(entries) ?? 'null'} }));
     process.exit(0);
   }
 

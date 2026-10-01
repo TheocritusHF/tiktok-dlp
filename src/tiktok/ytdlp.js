@@ -144,8 +144,11 @@ export async function listProfileVideos(usernameOrUrl, options = {}) {
     flatPlaylist: true,
   });
 
+  const username = resolvePlaylistUsername(
+    options.username, options.watch?.username, extractUsernameFromUrl(usernameOrUrl), usernameOrUrl,
+  );
   const entries = Array.isArray(raw.entries)
-    ? raw.entries.map((entry, index) => normalizePlaylistEntry(entry, sourceUrl, index))
+    ? raw.entries.map((entry, index) => normalizePlaylistEntry(entry, sourceUrl, index, { username }))
     : [];
   const metadata = normalizeMetadata(raw, sourceUrl);
   if (cachedSecUid && !metadata.secUid) metadata.secUid = cachedSecUid;
@@ -202,7 +205,7 @@ export async function listProfileStories(usernameOrUrl, options = {}) {
     ? raw.itemList.map((entry, index) => normalizeStoryEntry(entry, {
         ...profile,
         sourceUrl: storySourceUrl,
-      }, index)).filter((entry) => entry.videoId && entry.directVideoUrl)
+      }, index)).filter((entry) => entry.videoId && (entry.directVideoUrl || entry.imageUrls.length))
     : [];
   const hasStory = entries.length > 0;
 
@@ -687,7 +690,7 @@ function normalizePlaylistEntry(entry, sourceUrl, index, defaults = {}) {
   const raw = entry && typeof entry === 'object' ? entry : {};
   const mediaType = resolveMediaType({ ...defaults, ...raw }, raw.webpage_url ?? raw.original_url ?? raw.url ?? sourceUrl);
   const videoId = String(raw.id ?? extractIdFromEntryUrl(raw.url) ?? '');
-  const videoUrl = resolvePlaylistEntryUrl(raw, sourceUrl, mediaType, videoId);
+  const videoUrl = resolvePlaylistEntryUrl(raw, sourceUrl, mediaType, videoId, defaults.username);
   return {
     ...raw,
     id: videoId,
@@ -703,59 +706,27 @@ function normalizePlaylistEntry(entry, sourceUrl, index, defaults = {}) {
   };
 }
 
-function resolvePlaylistEntryUrl(entry = {}, sourceUrl = '', mediaType = '', videoId = '') {
-  const provided = [entry.webpage_url, entry.original_url, entry.url]
-    .map((value) => String(value ?? ''))
-    .find((text) => /^https?:\/\//i.test(text)) ?? '';
-  // secUid-cached profile listings make yt-dlp return secUid-based post URLs
-  // (/@MS4wLjABAAAA.../video/123). Prefer the human handle yt-dlp also reports
-  // so monitor source URLs stay canonical and human-readable.
-  const humanHandle = extractHumanTikTokHandle(entry);
-  if (provided && humanHandle) {
-    const rewritten = rewriteTikTokUrlHandle(provided, humanHandle);
-    if (rewritten) return rewritten;
-  }
-  if (provided) return provided;
+function resolvePlaylistUsername(...values) {
+  return values.map((value) => String(value ?? '').trim().replace(/^@/, ''))
+    .find((value) => /^[a-zA-Z0-9_.]{1,24}$/.test(value) && !value.endsWith('.')) ?? '';
+}
 
-  const username = humanHandle || String(
-    entry.uploader
-      ?? entry.channel
-      ?? entry.creator
-      ?? extractUsernameFromUrl(sourceUrl)
-      ?? '',
+function resolvePlaylistEntryUrl(entry = {}, sourceUrl = '', mediaType = '', videoId = '', knownUsername = '') {
+  const username = resolvePlaylistUsername(
+    entry.uploader, entry.channel, entry.creator, entry.username,
+    extractUsernameFromUrl(entry.uploader_url), knownUsername, extractUsernameFromUrl(sourceUrl),
   );
-  if (username && videoId) {
-    const kind = mediaType === 'story' ? 'story' : 'video';
+  if (username && /^\d+$/.test(videoId)) {
+    const kind = mediaType === 'story' ? 'story' : mediaType === 'slideshow' ? 'photo' : 'video';
     return `https://www.tiktok.com/@${username}/${kind}/${videoId}`;
   }
 
-  return String(sourceUrl ?? '');
-}
-
-function extractHumanTikTokHandle(entry = {}) {
-  const fromUploaderUrl = String(entry.uploader_url ?? '').match(/tiktok\.com\/@([A-Za-z0-9._]{1,32})(?:[/?#]|$)/i)?.[1];
-  if (fromUploaderUrl && !fromUploaderUrl.includes('..')) return fromUploaderUrl;
-  // yt-dlp `uploader` is the author's unique handle; `channel` is the display
-  // nickname and must not be used as a URL handle.
-  const uploader = String(entry.uploader ?? '');
-  if (/^[A-Za-z0-9._]{1,32}$/.test(uploader) && !uploader.includes('..')) return uploader;
-  return '';
-}
-
-function rewriteTikTokUrlHandle(urlText, handle) {
-  try {
-    const url = new URL(String(urlText));
-    if (!/(^|\.)tiktok\.com$/i.test(url.hostname)) return '';
-    const parts = url.pathname.split('/');
-    if (parts.length >= 4 && parts[1].startsWith('@') && /^(video|photo|story)$/i.test(parts[2] ?? '')) {
-      parts[1] = `@${handle}`;
-      url.pathname = parts.join('/');
-      return url.href;
-    }
-  } catch {
-    // Fall through to the provided URL unchanged.
+  for (const value of [entry.webpage_url, entry.original_url, entry.url]) {
+    const text = String(value ?? '');
+    if (/^https?:\/\//i.test(text)) return text;
   }
-  return '';
+
+  return /^https?:\/\//i.test(sourceUrl) ? String(sourceUrl) : '';
 }
 
 function extractUsernameFromUrl(sourceUrl = '') {
@@ -917,7 +888,6 @@ function normalizeStoryEntry(item, profile = {}, index = 0) {
   const video = raw.video && typeof raw.video === 'object' ? raw.video : {};
   const id = String(raw.id ?? video.id ?? video.videoID ?? '');
   const username = String(raw.author?.uniqueId ?? profile.username ?? '');
-  const storyPageUrl = username && id ? `https://www.tiktok.com/@${username}/story/${id}` : String(profile.sourceUrl ?? '');
   const directVideoUrl = firstString(
     video.playAddr,
     video.downloadAddr,
@@ -925,6 +895,18 @@ function normalizeStoryEntry(item, profile = {}, index = 0) {
     video.PlayAddrStruct?.urlList,
     video.bitRateInfo?.map((entry) => entry?.PlayAddr?.UrlList ?? entry?.PlayAddr?.urlList),
   );
+  const images = raw.imagePost?.images ?? raw.image_post_info?.images;
+  const imageUrls = Array.isArray(images)
+    ? images.map((image) => firstString(
+        image?.imageURL?.urlList,
+        image?.image_url?.url_list,
+        image?.display_image?.url_list,
+        image?.downloadURL?.urlList,
+        image?.download_url?.url_list,
+      )).filter(Boolean)
+    : [];
+  const kind = !directVideoUrl && imageUrls.length ? 'photo' : 'story';
+  const storyPageUrl = username && id ? `https://www.tiktok.com/@${username}/${kind}/${id}` : String(profile.sourceUrl ?? '');
   const dataSize = numberOrNull(video.PlayAddrStruct?.DataSize ?? video.size ?? video.dataSize) ?? 0;
   return {
     id,
@@ -940,6 +922,7 @@ function normalizeStoryEntry(item, profile = {}, index = 0) {
     username,
     mediaType: 'story',
     directVideoUrl,
+    imageUrls,
     timestamp: numberOrNull(raw.createTime) ?? 0,
     duration: numberOrNull(video.duration) ?? 0,
     thumbnail: firstString(video.cover, video.dynamicCover, video.originCover) || '',
@@ -1092,7 +1075,7 @@ async function downloadPhotoPost(sourceUrl, metadata, tempDir, options = {}) {
     title: normalized.title || '',
     description: normalized.description || '',
     thumbnailUrl: normalized.thumbnail || '',
-    mediaType: 'slideshow',
+    mediaType: normalized.mediaType === 'story' ? 'story' : 'slideshow',
     imageCount: imageEntries.length,
     slideshowImagePaths,
     duration: numberOrNull(normalized.duration) ?? 0,
@@ -1350,7 +1333,7 @@ function shouldTryPhotoFallback(sourceUrl, error, options = {}) {
 }
 
 function isPhotoPostMetadata(metadata) {
-  return metadata?.mediaType === 'slideshow'
+  return (metadata?.mediaType === 'slideshow' || (metadata?.mediaType === 'story' && !isStoryMetadata(metadata)))
     && Array.isArray(metadata?.imageUrls)
     && metadata.imageUrls.length > 0;
 }

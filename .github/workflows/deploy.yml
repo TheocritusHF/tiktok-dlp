@@ -25,11 +25,17 @@ jobs:
     runs-on: [self-hosted, yufeihl]
     timeout-minutes: 20
     env:
-      ROOT: /home/yufei/tiktok-discord-downloader
+      ROOT: /home/yufei/tiktok-dlp-production
+      COMPOSE_PROJECT_NAME: tiktok-discord-downloader
     defaults:
       run:
         shell: bash
     steps:
+      - name: Set up Node.js for deployment tools
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Verify production checkout
         run: |
           set -euo pipefail

@@ -104,10 +104,13 @@ test("removing a bookmark keeps the adjacent card active and restores control fo
   const firstId = await page.locator("[data-feed-card]").first().getAttribute("data-video-id");
   await expect(activeCard).toHaveAttribute("data-video-id", firstId!);
 
-  const firstActive = await activeCard.getAttribute("data-video-id");
-  await page.locator("#feed-stage").focus();
-  await page.keyboard.press("ArrowDown");
-  await expect.poll(() => activeCard.getAttribute("data-video-id")).not.toBe(firstActive);
+  await expect(page.locator("[data-feed-card]")).toHaveCount(4);
+  const secondCard = page.locator("[data-feed-card]").nth(1);
+  const secondId = await secondCard.getAttribute("data-video-id");
+  await secondCard.evaluate((card) => {
+    card.scrollIntoView({ block: "start", behavior: "instant" });
+  });
+  await expect(activeCard).toHaveAttribute("data-video-id", secondId!);
   await revealFeedControls(page);
   const orderedIds = await page.locator("[data-feed-card]").evaluateAll((cards) => (
     cards.map((card) => (card as HTMLElement).dataset.videoId || "")
