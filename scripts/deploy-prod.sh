@@ -3,7 +3,8 @@
 # Does not print cookie values, tokens, or .env contents.
 set -euo pipefail
 
-ROOT="${ROOT:-/home/yufei/tiktok-discord-downloader}"
+ROOT="${ROOT:-/home/yufei/tiktok-dlp-production}"
+export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-tiktok-discord-downloader}"
 BACKEND_SERVICE="tiktok-discord-downloader"
 REWIND_SERVICE="rewind-web"
 SERVICES=("$BACKEND_SERVICE" "$REWIND_SERVICE")

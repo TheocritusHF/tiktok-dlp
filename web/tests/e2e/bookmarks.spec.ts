@@ -84,17 +84,33 @@ test("another open tab refreshes only after a bookmark mutation reaches the serv
 });
 
 test("removing a bookmark keeps the adjacent card active and restores control focus", async ({ page, archive }) => {
+  // The exact linked file is last when the full bookmark page arrives.
+  await page.addInitScript(() => {
+    Object.defineProperty(crypto, "getRandomValues", {
+      value: (values: Uint32Array) => { values[0] = 1; return values; },
+    });
+  });
   archive.seedBookmarks(["1001", "1002", "1003", "1004"]);
+  const firstPage = archive.delayNextBookmarkedPage();
   await page.goto("/?video=1001");
   await revealFeedControls(page);
   await page.getByRole("button", { name: "Bookmarks", exact: true }).click();
+  await firstPage.waitUntilRequested();
+  await expect(page.getByRole("heading", { name: /^Loading bookmarks/ })).toBeVisible();
+  await expect(page.locator("[data-feed-card]")).toHaveCount(0);
+  firstPage.release();
   const activeCard = page.locator('[data-feed-card][aria-hidden="false"]');
   await expect(activeCard).toHaveCount(1);
+  const firstId = await page.locator("[data-feed-card]").first().getAttribute("data-video-id");
+  await expect(activeCard).toHaveAttribute("data-video-id", firstId!);
 
-  const firstActive = await activeCard.getAttribute("data-video-id");
-  await page.locator("#feed-stage").focus();
-  await page.keyboard.press("ArrowDown");
-  await expect.poll(() => activeCard.getAttribute("data-video-id")).not.toBe(firstActive);
+  await expect(page.locator("[data-feed-card]")).toHaveCount(4);
+  const secondCard = page.locator("[data-feed-card]").nth(1);
+  const secondId = await secondCard.getAttribute("data-video-id");
+  await secondCard.evaluate((card) => {
+    card.scrollIntoView({ block: "start", behavior: "instant" });
+  });
+  await expect(activeCard).toHaveAttribute("data-video-id", secondId!);
   await revealFeedControls(page);
   const orderedIds = await page.locator("[data-feed-card]").evaluateAll((cards) => (
     cards.map((card) => (card as HTMLElement).dataset.videoId || "")
@@ -136,14 +152,26 @@ test("loads creator-scoped bookmark pages without leaking another creator", asyn
   const firstPageParams = new URLSearchParams(firstPage?.search);
   expect(firstPageParams.get("creatorId")).toBe("creator-alice");
   expect(firstPageParams.get("limit")).toBe("36");
-  await expect(page.getByRole("button", { name: "Load more bookmarks" })).toBeVisible();
-  await page.locator("#feed-video-list").evaluate((scroller) => scroller.scrollTo(0, scroller.scrollHeight));
+  const loadMore = page.getByRole("button", { name: "Load more bookmarks" });
+  await expect(loadMore).toBeVisible();
+  const scroller = page.locator("#feed-video-list");
+  await scroller.evaluate((element) => element.scrollTo(0, element.scrollHeight));
+  await expect.poll(() => scroller.evaluate((element) => Math.round(element.scrollTop / element.clientHeight))).toBe(36);
+  await expect(loadMore).toBeInViewport();
   const activeCard = page.locator('[data-feed-card][aria-hidden="false"]');
-  await expect(activeCard).toHaveCount(1);
-  const activeBeforeLoad = await activeCard.getAttribute("data-video-id");
-  await page.getByRole("button", { name: "Load more bookmarks" }).evaluate((button: HTMLButtonElement) => button.click());
+  const nextPage = archive.delayNextBookmarkedPage({ cursor: "fixture:36" });
+  await loadMore.click();
+  await nextPage.waitUntilRequested();
+  await expect(page.getByRole("button", { name: "Loading more bookmarks…" })).toBeDisabled();
+  nextPage.release();
   await expect.poll(() => archive.requestLog({ method: "GET", pathname: "/api/videos", includes: "bookmarked=1" }).some((entry) => new URLSearchParams(entry.search).has("cursor"))).toBe(true);
-  await expect(activeCard).toHaveAttribute("data-video-id", activeBeforeLoad || "");
+  await expect.poll(() => scroller.evaluate((element) => {
+    const card = element.querySelector('[data-feed-card][aria-hidden="false"]');
+    if (!card) return -1;
+    return Math.round((card.getBoundingClientRect().top - element.getBoundingClientRect().top + element.scrollTop) / element.clientHeight);
+  })).toBe(36);
+  await expect(activeCard).toBeInViewport();
+  await expect.poll(() => activeCard.getAttribute("data-video-id")).toMatch(/^10(?:3[7-9]|[4-6]\d|7[0-2])$/);
 
   await page.goto("/?creator=creator-bob");
   await revealFeedControls(page);

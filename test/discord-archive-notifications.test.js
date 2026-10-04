@@ -106,16 +106,24 @@ test('quality upgrade notice goes only to a server still watching that creator',
     config: { discordQualityUpgradesChannelId: 'quality' },
     store: { listWatchSubscriptions: () => [{ guild_id: 'guild-a', channel_id: 'watch' }] },
     upgrade: {
-      username: 'creator', sourceUrl: 'https://www.tiktok.com/@creator/video/123',
-      previous: { width: 576, height: 1024 }, current: { width: 1080, height: 1920 },
+      username: 'creator', videoId: '123', sourceUrl: 'https://www.tiktok.com/@creator/video/123',
+      previous: { width: 576, height: 1024 }, current: { width: 1080, height: 1920, codec: 'hevc' }, stage: '6h',
     },
   };
   assert.equal(await sendQualityUpgradeAlert(args), true);
   assert.equal(messages.length, 1);
   assert.equal(messages[0][0], 'quality');
   assert.deepEqual(messages[0][1].allowedMentions, { parse: [] });
-  assert.deepEqual(messages[0][1].embeds[0].data.fields.map(({ value }) => value),
-    ['@creator', '576x1024', '1080x1920']);
+  assert.deepEqual(messages[0][1], {
+    content: [
+      '✅ **TikTok video quality upgraded**',
+      'Account: @creator',
+      'Quality: 576×1024 → 1080×1920 (hevc)',
+      'Check: 6h',
+      'Post: https://www.tiktok.com/@creator/video/123',
+    ].join('\n'),
+    allowedMentions: { parse: [] },
+  });
 
   args.store.listWatchSubscriptions = () => [{ guild_id: 'dm:private', channel_id: 'private' }];
   assert.equal(await sendQualityUpgradeAlert(args), false);

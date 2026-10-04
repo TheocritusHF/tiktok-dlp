@@ -1,10 +1,11 @@
 # Combined fork preview
 
-This branch combines the proposed changes from seven upstream pull requests in
-one installable checkout. The current prerelease snapshot is
-[`v0.1.0-preview.2`](https://github.com/TheocritusHF/tiktok-dlp/releases/tag/v0.1.0-preview.2);
-this is a fork preview, not an upstream release. The fork's default `main`
-remains a documentation-only overview of these proposals.
+This fork combines proposals from seven upstream pull requests with the
+upstream changes tested in this integration. The `release/combined-preview`
+branch tracks the current installable checkout. The
+[`v0.1.0-preview.2`](https://github.com/TheocritusHF/tiktok-dlp/releases/tag/v0.1.0-preview.2)
+tag remains an earlier fixed snapshot; inspect the branch commit before
+deploying a newer checkout. This is a fork integration, not an upstream release.
 
 | Area | Upstream proposal | Enabled by default? |
 | --- | --- | --- |
@@ -98,8 +99,7 @@ project's [backup and recovery instructions](README.md#backups-and-recovery)
 when moving an existing archive. Do not point two running checkouts at the
 same SQLite database or downloads directory.
 
-This preview branch can be updated when the individual PRs change. Use the
-`v0.1.0-preview.2` tag for a fixed snapshot; the earlier `v0.1.0-preview.1`
-tag remains at its original commit. The branch is not the upstream project's
-installation branch; compare its commit and release notes before updating an
-existing deployment.
+This branch can be updated as upstream and the individual proposals change.
+The `v0.1.0-preview.2` and `v0.1.0-preview.1` tags remain fixed at their
+original commits; neither tag contains this newer integration. Compare the
+branch commit with your deployed version before updating an existing archive.

@@ -1,6 +1,8 @@
 import { test, expect } from "./fixtures/archive";
 import { revealFeedControls } from "./helpers";
 
+// System-font baselines are reviewed on the Ubuntu 24.04 Chromium CI runner.
+// Other host font sets can render differently; do not regenerate these blindly.
 test("desktop dashboard visual regression", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop-chromium", "desktop baseline");
   await page.goto("/dashboard");

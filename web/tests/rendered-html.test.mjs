@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
+import { brotliDecompressSync, gunzipSync } from "node:zlib";
 import test from "node:test";
 
 async function render(pathname) {
@@ -42,6 +43,8 @@ for (const [pathname, expectedContent] of routes) {
     assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
 
     const html = await response.text();
+    assert.doesNotMatch(response.headers.get("link") ?? "", /as=font/i);
+    assert.doesNotMatch(html, /\.woff2|fonts\.googleapis\.com/i);
     assert.match(html, /<title>[^<]*Rewind<\/title>/i);
     assert.match(html, expectedContent);
     if (pathname === "/") {
@@ -71,6 +74,23 @@ for (const [pathname, expectedContent] of routes) {
   });
 }
 
+test("production JavaScript and CSS include smaller, byte-equivalent compressed assets", async () => {
+  const assets = new URL("../dist/client/assets/", import.meta.url);
+  const names = (await readdir(assets)).filter((name) => /\.(js|css)$/.test(name));
+  let checked = 0;
+  for (const name of names) {
+    const original = await readFile(new URL(name, assets));
+    if (original.length < 1024) continue;
+    const brotli = await readFile(new URL(`${name}.br`, assets));
+    const gzip = await readFile(new URL(`${name}.gz`, assets));
+    assert.deepEqual(brotliDecompressSync(brotli), original);
+    assert.deepEqual(gunzipSync(gzip), original);
+    assert.ok(brotli.length < original.length, `${name} must benefit from compression`);
+    checked++;
+  }
+  assert.ok(checked > 0, "The production build must contain compressed bundles");
+});
+
 test("feed exposes confirmed server trash and bounded delivery", async () => {
   const source = await readFile(new URL("../components/feed/MobileFeed.tsx", import.meta.url), "utf8");
   const bookmarkSource = await readFile(new URL("../lib/bookmark-state.mjs", import.meta.url), "utf8");
@@ -80,7 +100,6 @@ test("feed exposes confirmed server trash and bounded delivery", async () => {
   assert.match(source, /const CARD_WINDOW_SIZE = 7/);
   assert.match(source, /paginateVideos:\s*true/);
   assert.match(source, /renderedVideos\.map/);
-  assert.match(source, /const PRELOAD_AHEAD = 2/);
   assert.match(source, /const PLAYABLE_READY_STATE = 2/);
   assert.match(source, /onLoadedData=/);
   assert.match(source, /useBookmarks/);

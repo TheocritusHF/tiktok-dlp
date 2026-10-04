@@ -1,12 +1,12 @@
 # tiktok-dlp
 
-> **Combined fork preview:** This branch integrates upstream proposals
-> [#23–#29](RELEASE_PREVIEW.md) for use together. See the
-> [preview installation guide](RELEASE_PREVIEW.md) for setup and feature
-> settings. The fixed snapshot is
-> [`v0.1.0-preview.2`](https://github.com/TheocritusHF/tiktok-dlp/releases/tag/v0.1.0-preview.2).
-> The branch is separate from the fork's default `main`. Optional recording, quality, and notification features remain off
-> until configured.
+> **Fork integration:** This checkout combines proposals
+> [#23–#29](RELEASE_PREVIEW.md) with recent upstream changes. See the
+> [installation guide](RELEASE_PREVIEW.md) for setup and feature settings.
+> The [`v0.1.0-preview.2`](https://github.com/TheocritusHF/tiktok-dlp/releases/tag/v0.1.0-preview.2)
+> tag is an earlier fixed snapshot; check the branch commit for the current
+> integration. Optional recording, quality, and notification features remain
+> off until configured.
 
 Self-hosted social-media downloader and archive for TikTok, Instagram, and X,
 with TikTok monitoring and full-profile imports plus **Rewind**: a private,
@@ -142,7 +142,7 @@ Recommended production setup:
 For direct local development:
 
 - Node.js `>=22.13.0`
-- `yt-dlp`, `gallery-dl` 1.32.10, and ffmpeg for backend download work
+- `yt-dlp`, `gallery-dl` 1.32.14, and ffmpeg for backend download work
 - Python 3 and ffmpeg for the live Rewind metadata and thumbnail fallbacks
 
 ## Quick start with Docker
@@ -500,6 +500,40 @@ download service now consumes these adapters
 and persists their ordered assets; Discord presentation can use the resulting
 post bundle or individual media files.
 
+Instagram monitor polls run no more often than every 15 minutes per creator
+(or the configured poll interval if longer), with one Instagram creator poll
+at a time. TikTok keeps its configured cadence. This reduces scheduled
+Instagram polls by about 93% compared with a one-minute interval; new posts
+and Stories can take up to 15 minutes to appear. Failed Instagram polls back
+off from 15 minutes to six hours, and failed Story checks are not treated as
+successful empty polls.
+
+Account-wide rate limits pause Instagram listings and extraction for six
+hours. Login failures, challenges, and account-review feedback pause them for
+24 hours. The pause is saved in `DATA_DIR/instagram-account-cooldown.json`, so
+restarting the bot or forcing a watch run does not bypass it. Instagram
+extractor requests have no immediate HTTP retries, and the gallery-dl
+fallback does not run during an account pause. The private client does not
+attempt to solve security challenges automatically. These are local conservative
+delays, not Instagram-provided recovery times or a guarantee against bans.
+Creator-specific permission failures remain isolated to that creator.
+
+Use an account whose loss would be acceptable, preserve its existing device
+settings and network route, and avoid repeated logouts, cookie refreshes, or
+manual force-runs when a restriction appears. Resolve security/account prompts
+in the official Instagram app, confirm ordinary browsing works, and let the
+pause expire before one verification attempt. Do not rotate accounts or routes
+to work around a restriction. Automated access can still lead to account
+restrictions; use an approved API/integration where it supports the needed
+content if account reliability is essential.
+
+The Docker build applies `scripts/patch-gallery-dl.py` to pinned gallery-dl
+1.32.14: Instagram merged-video variants may omit width/height, which are
+reported as unknown without changing the selected MP4. The build tests the
+real parser with missing and present dimensions and an image Story. The patch
+intentionally rejects a different gallery-dl version or source layout; review
+and remove it when upgrading to an upstream release that passes those cases.
+
 If TikTok requires a logged-in session, export a **full** Netscape `tiktok.com`
 cookie jar (not a hand-picked subset). The working live path needed
 `sessionid`, `ttwid`, `msToken`, `odin_tt`, `sid_ucp_v1`, `uid_tt`, and the rest
@@ -642,18 +676,20 @@ Pull requests and pushes to `main` run backend tests and syntax/contracts,
 Rewind lint/unit/integration/build checks, desktop and mobile Chromium
 workflows, Compose validation, and production builds for both images.
 
-A successful `main` workflow deploys its exact tested commit on the self-hosted
-runner labeled `yufeihl`; a later untested commit cannot be picked up by the
-same deployment. `scripts/deploy-prod.sh` builds the backend and Rewind while
-the old stack remains online, creates a verified SQLite backup, recreates both
-services together, and waits for dependency-aware health plus Discord login.
-The existing `cloudflared` container is left running. A stale workflow refuses
-to roll production backward if a newer commit is already deployed.
+GitHub deployment is manual on this fork. Pushing `main` runs CI but does not
+replace any running containers. The manual deployment workflow accepts an
+optional commit SHA on `main`, checks that it belongs to the current branch,
+and then runs `scripts/deploy-prod.sh`, which builds both images, creates a
+verified SQLite backup, recreates the services, and waits for their health
+checks. It does not deploy a newer untested commit in place of the requested
+SHA.
 
-Register the runner under repo **Settings → Actions → Runners**. Add the label
-`yufeihl` and use a work directory outside the production checkout, for example
-`~/actions-runner`. Keep `.env`, cookies, `data/`, and `.secrets/` on the host;
-they are not in git.
+The supplied workflow retains a Linux self-hosted runner label (`yufeihl`)
+and paths under `/home/yufei` from upstream. Configure those values and the
+Compose project name for your own Linux host before dispatching it. Windows
+Docker Desktop installations use the [installation guide](RELEASE_PREVIEW.md)
+and their local Compose configuration instead. Keep `.env`, cookies, `data/`,
+and `.secrets/` outside git.
 
 ## Operational notes
 

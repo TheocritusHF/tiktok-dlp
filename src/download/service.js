@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { readdir, rm } from 'node:fs/promises';
+import { readFile, readdir, rm } from 'node:fs/promises';
 import {
   detectPlatform,
   normalizePlatformHandle,
@@ -273,57 +273,71 @@ export class DownloadService {
   }
 
   async #getAsset(input) {
-    const metadata = await this.#resolveMetadata(input);
-    const key = canonicalDownloadKey(input.sourceUrl, metadata, input.platform);
-    const existing = this.#downloadInFlight.get(key);
-    if (existing) return existing;
-
-    const promise = this.#enqueue(() => this.#materializeAsset(input, metadata))
-      .finally(() => {
-        if (this.#downloadInFlight.get(key) === promise) this.#downloadInFlight.delete(key);
+    if (!input.metadata && input.reference?.remoteId) {
+      const cached = await this.#findReusableDownload(
+        { id: input.reference.remoteId }, input.platform, input.adapter,
+      );
+      if (cached) {
+        const metadata = this.store.getMediaPost?.(input.platform, input.reference.remoteId)
+          ? {}
+          : input.platform === 'tiktok' ? await readLegacyTikTokMetadata(cached) : null;
+        if (metadata) {
+          return this.#resultFromExistingAsset(
+            cached, normalizePlatformMetadata(metadata, input), input.sourceUrl,
+            input.username, input.platform, input.adapter,
+          );
+        }
+        // Legacy TikTok files without usable metadata still need a probe for their captions.
+        if (input.platform === 'tiktok') input = { ...input, forceProbe: true };
+      }
+    }
+    const identityKey = canonicalDownloadKey(input.sourceUrl, input.metadata, input.platform);
+    const pending = this.#identityInFlight.get(identityKey);
+    if (pending) return pending;
+    // Keep the worker through saving, so later probes cannot delay a ready download.
+    const promise = this.#enqueue(async () => {
+      const metadata = await this.#resolveMetadata(input);
+      const key = canonicalDownloadKey(input.sourceUrl, metadata, input.platform);
+      const existing = this.#downloadInFlight.get(key);
+      if (existing) return existing;
+      const asset = this.#materializeAsset(input, metadata).finally(() => {
+        if (this.#downloadInFlight.get(key) === asset) this.#downloadInFlight.delete(key);
       });
-    this.#downloadInFlight.set(key, promise);
-    return promise;
-  }
-
-  #resolveMetadata(input) {
-    if (input.metadata) {
-      return Promise.resolve(normalizePlatformMetadata(input.metadata, input));
-    }
-    if (input.adapter?.capabilities?.probeBeforeDownload === false && input.reference?.remoteId) {
-      return Promise.resolve(normalizePlatformMetadata({
-        id: input.reference.remoteId,
-        remoteId: input.reference.remoteId,
-        webpage_url: input.reference.canonicalUrl || input.sourceUrl,
-      }, input));
-    }
-
-    const identityKey = canonicalDownloadKey(input.sourceUrl, null, input.platform);
-    const existing = this.#identityInFlight.get(identityKey);
-    if (existing) return existing;
-
-    const platformProbe = this.platformProbers.get(input.platform)
-      || (typeof input.adapter?.probe === 'function'
-        ? (sourceUrl, options) => input.adapter.probe(sourceUrl, options)
-        : null);
-    const metadataOperation = typeof platformProbe === 'function'
-      ? () => platformProbe(input.sourceUrl, {
-        config: this.config,
-        platform: input.platform,
-        reference: input.reference,
-      })
-      : null;
-    if (!metadataOperation) {
-      throw new Error(`${displayPlatform(input.platform)} metadata extraction is not configured.`);
-    }
-
-    const promise = this.#enqueue(metadataOperation)
-      .then((metadata) => normalizePlatformMetadata(metadata, input))
+      this.#downloadInFlight.set(key, asset);
+      return asset;
+    })
       .finally(() => {
         if (this.#identityInFlight.get(identityKey) === promise) this.#identityInFlight.delete(identityKey);
       });
     this.#identityInFlight.set(identityKey, promise);
     return promise;
+  }
+
+  async #resolveMetadata(input) {
+    if (input.metadata) {
+      return normalizePlatformMetadata(input.metadata, input);
+    }
+    if (!input.forceProbe && input.adapter?.capabilities?.probeBeforeDownload === false && input.reference?.remoteId) {
+      return normalizePlatformMetadata({
+        id: input.reference.remoteId,
+        remoteId: input.reference.remoteId,
+        webpage_url: input.reference.canonicalUrl || input.sourceUrl,
+      }, input);
+    }
+
+    const platformProbe = this.platformProbers.get(input.platform)
+      || (typeof input.adapter?.probe === 'function'
+        ? (sourceUrl, options) => input.adapter.probe(sourceUrl, options)
+        : null);
+    if (typeof platformProbe !== 'function') {
+      throw new Error(`${displayPlatform(input.platform)} metadata extraction is not configured.`);
+    }
+    const metadata = await platformProbe(input.sourceUrl, {
+      config: this.config,
+      platform: input.platform,
+      reference: input.reference,
+    });
+    return normalizePlatformMetadata(metadata, input);
   }
 
   async #materializeAsset(input, metadata) {
@@ -541,6 +555,8 @@ export class DownloadService {
       ? this.store.listMediaAssetsForFile(fileRecord.id).map(normalizeStoredAsset)
       : [];
     const contentAssets = storedAssets.filter((asset) => asset.role === 'content');
+    const mediaType = metadata?.mediaType || storedPost?.media_type || inferMediaType(contentAssets);
+    const imageCount = metadata?.imageCount ?? contentAssets.filter((asset) => asset.kind === 'image').length;
     const storedPublishedAt = storedPost?.published_at == null
       ? null
       : new Date(Number(storedPost.published_at)).toISOString();
@@ -561,10 +577,10 @@ export class DownloadService {
       title: metadata?.title || storedPost?.title || '',
       description: metadata?.description || storedPost?.description || '',
       thumbnailUrl: metadata?.thumbnail || '',
-      mediaType: metadata?.mediaType || storedPost?.media_type || inferMediaType(contentAssets),
-      imageCount: metadata?.imageCount ?? contentAssets.filter((asset) => asset.kind === 'image').length,
+      mediaType,
+      imageCount,
       publishedAt: metadata?.publishedAt ?? storedPublishedAt,
-      slideshowImagePaths: await findSlideshowImagePaths(fileRecord.path, metadata),
+      slideshowImagePaths: await findSlideshowImagePaths(fileRecord.path, { mediaType, imageCount }),
       assets: contentAssets,
       assetCount: contentAssets.length,
       duration: Number(metadata?.duration ?? storedPost?.duration_seconds ?? 0) || 0,
@@ -657,6 +673,32 @@ function normalizePlatformMetadata(metadata, input) {
     remoteId: String(value.remoteId || value.id || input.reference?.remoteId || ''),
     webpage_url: value.webpage_url || value.canonicalUrl || input.reference?.canonicalUrl || input.sourceUrl,
   };
+}
+
+async function readLegacyTikTokMetadata(file) {
+  const metadataPath = path.join(path.dirname(file.path), `${file.video_id}.info.json`);
+  try {
+    if (await fileSize(metadataPath) > 1024 * 1024) return null;
+    const metadata = JSON.parse(await readFile(metadataPath, 'utf8'));
+    if (String(metadata?.id) !== String(file.video_id)
+      || (metadata.platform && metadata.platform !== 'tiktok')
+      || typeof metadata.title !== 'string') return null;
+    // Keep display fields without carrying expired download formats forward.
+    return {
+      id: String(file.video_id),
+      title: metadata.title,
+      description: String(metadata.description || ''),
+      duration: metadata.duration,
+      thumbnail: String(metadata.thumbnail || ''),
+      mediaType: metadata.mediaType || metadata.media_type
+        || (path.extname(file.path).toLowerCase() === '.zip' ? 'slideshow'
+          : path.extname(file.path).toLowerCase() === '.mp4' ? 'video' : ''),
+      imageCount: metadata.imageCount ?? metadata.images?.length ?? 0,
+      publishedAt: normalizePersistedTimestamp(metadata.publishedAt ?? metadata.timestamp),
+    };
+  } catch {
+    return null;
+  }
 }
 
 function normalizeDownloadedAssets(values, slideshowImagePaths = []) {

@@ -108,6 +108,7 @@ services:
       - "3000"
     volumes:
       - ./data:/app/data:ro
+      - rewind-live-cache:/app/web/.live-cache
     depends_on:
       tiktok-discord-downloader:
         condition: service_healthy
@@ -127,6 +128,9 @@ services:
       - tiktok-discord-downloader
       - rewind-web
     restart: unless-stopped
+
+volumes:
+  rewind-live-cache:
 
 secrets:
   cloudflare_tunnel_token:

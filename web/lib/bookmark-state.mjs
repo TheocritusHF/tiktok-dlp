@@ -1,3 +1,5 @@
+import { fetchJson } from "./json-request.mjs";
+
 export const BOOKMARK_STORAGE_KEY = "rewind-bookmarks";
 export const BOOKMARK_MIGRATION_STORAGE_KEY = "rewind-bookmarks-server-migrated-v1";
 export const BOOKMARK_SYNC_STORAGE_KEY = "rewind-bookmarks-server-sync-v1";
@@ -378,22 +380,12 @@ export class BookmarkController {
   async #requestJson(path, init) {
     for (let attempt = 0; ; attempt += 1) {
       try {
-        const response = await this.#fetch(`${this.#base}${path}`, {
+        return await fetchJson(`${this.#base}${path}`, {
           ...init,
           signal: this.#lifetime.signal,
-        });
-        if (!response.ok) {
-          const payload = await response.json().catch(() => ({}));
-          const message = payload && typeof payload.error === "string"
-            ? payload.error
-            : `Bookmark request failed (${response.status})`;
-          const error = new Error(message);
-          error.status = response.status;
-          throw error;
-        }
-        return await response.json().catch(() => ({}));
+        }, { fetchImpl: this.#fetch });
       } catch (error) {
-        if (isAbortError(error)) throw error;
+        if (isAbortError(error) || error.name === "TimeoutError") throw error;
         const status = Number(error?.status) || 0;
         const retryable = status === 0 || status === 408 || status === 429 || status >= 500;
         if (!retryable || attempt >= BOOKMARK_RETRY_DELAYS_MS.length) throw error;
