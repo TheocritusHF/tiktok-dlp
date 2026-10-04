@@ -676,24 +676,20 @@ Pull requests and pushes to `main` run backend tests and syntax/contracts,
 Rewind lint/unit/integration/build checks, desktop and mobile Chromium
 workflows, Compose validation, and production builds for both images.
 
-A successful `main` workflow deploys its exact tested commit on the self-hosted
-runner labeled `yufeihl`; a later untested commit cannot be picked up by the
-same deployment. `scripts/deploy-prod.sh` builds the backend and Rewind while
-the old stack remains online, creates a verified SQLite backup, recreates both
-services together, and waits for dependency-aware health plus Discord login.
-The existing `cloudflared` container is left running. A stale workflow refuses
-to roll production backward if a newer commit is already deployed.
+GitHub deployment is manual on this fork. Pushing `main` runs CI but does not
+replace any running containers. The manual deployment workflow accepts an
+optional commit SHA on `main`, checks that it belongs to the current branch,
+and then runs `scripts/deploy-prod.sh`, which builds both images, creates a
+verified SQLite backup, recreates the services, and waits for their health
+checks. It does not deploy a newer untested commit in place of the requested
+SHA.
 
-Register the runner under repo **Settings → Actions → Runners**. Add the label
-`yufeihl` and use a work directory outside the production checkout, for example
-`~/actions-runner`. Keep `.env`, cookies, `data/`, and `.secrets/` on the host;
-they are not in git. Deployment uses a clean checkout at
-`/home/yufei/tiktok-dlp-production`, with `.env`, `.secrets`, `cookies`, and `data`
-linked to the existing runtime paths in `/home/yufei/tiktok-discord-downloader`.
-The fixed Compose project name `tiktok-discord-downloader` preserves the existing
-containers, network, and cache volume. Develop in the original checkout; only
-committed `main` revisions deploy. The workflow sets up Node.js 22 for host-side backup tools;
-it does not depend on an interactive shell loading nvm.
+The supplied workflow retains a Linux self-hosted runner label (`yufeihl`)
+and paths under `/home/yufei` from upstream. Configure those values and the
+Compose project name for your own Linux host before dispatching it. Windows
+Docker Desktop installations use the [installation guide](RELEASE_PREVIEW.md)
+and their local Compose configuration instead. Keep `.env`, cookies, `data/`,
+and `.secrets/` outside git.
 
 ## Operational notes
 
