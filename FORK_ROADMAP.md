@@ -85,11 +85,11 @@ contains PRs #23–#29 together with the tested upstream integration, with a
 separate [installation guide](https://github.com/TheocritusHF/tiktok-dlp/blob/release/combined-preview/RELEASE_PREVIEW.md).
 The Docker backend test run passed 337 tests with one skip, and the live trial
 confirmed quality upgrades, Discord notifications, and LIVE recording. The
-[`v0.1.0-preview.2`](https://github.com/TheocritusHF/tiktok-dlp/releases/tag/v0.1.0-preview.2)
-tag is a fixed earlier snapshot; the branch has newer changes. This is a fork
-integration, not an upstream release. Its optional features remain disabled
-until configured. Back up an existing archive before upgrading, since #25
-adds a SQLite migration.
+[`v1.0.0`](https://github.com/TheocritusHF/tiktok-dlp/releases/tag/v1.0.0)
+tag is the first fixed full release of this fork. Earlier preview tags remain
+unchanged, and the branch may receive later changes. This is independent of
+upstream's releases. Its optional features remain disabled until configured.
+Back up an existing archive before upgrading, since #25 adds a SQLite migration.
 
 The fork's default `main` includes the combined feature code and this roadmap.
 Individual PR branches remain separate for upstream review and can change
