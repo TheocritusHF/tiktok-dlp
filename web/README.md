@@ -141,10 +141,11 @@ always retain the original bytes. The first request for an uncached playback
 copy can take seconds to over a minute to encode. Conversion runs one at a time
 with a bounded queue; it never delays archive-list responses. Copies and
 thumbnails share `.live-cache`, persisted by Compose in the `rewind-live-cache`
-volume and bounded to 5 GiB by default. Prepared playback copies do not expire
-by age; thumbnails and cached originals expire after seven days. Size pressure
-can evict the oldest inactive files, including playback copies. Clearing the
-volume forces regeneration without affecting the archive.
+volume and bounded to 5 GiB by default. Prepared playback copies, thumbnails,
+and cached originals expire after seven days by default. Successful trash and
+delete actions clear prepared playback copies immediately; size pressure can
+evict the oldest inactive files. Clearing the volume forces regeneration without
+affecting the archive.
 
 The public playback policy version changes independently of the encoding
 version, so a policy update can reuse existing copies without serving cached

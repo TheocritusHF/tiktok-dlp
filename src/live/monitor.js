@@ -1,5 +1,6 @@
 import { randomBytes, randomUUID } from 'node:crypto';
-import { copyFile, mkdir, readFile, readdir, rename, rm, stat, statfs, writeFile, chmod } from 'node:fs/promises';
+import { copyFile, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, statfs, writeFile, chmod } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { discoverLiveFormats, qualityImproves } from './adaptive-quality.js';
 import {
@@ -42,7 +43,8 @@ export class LiveMonitor {
     this.root = path.join(config.dataDir, 'live');
     this.sessionDir = path.join(this.root, 'sessions');
     this.stageRoot = path.join(this.root, 'staging');
-    this.cookiesDir = path.join(this.root, 'private-cookies');
+    this.legacyCookiesDir = path.join(this.root, 'private-cookies');
+    this.cookiesDir = '';
     this.pollMs = Math.max(POLL_MINIMUM_MS, Number(config.livePollSeconds || 120) * 1_000);
     this.maxConcurrent = Math.max(1, Math.min(8, Number(config.liveMaxConcurrent || 2)));
     this.probeConcurrency = Math.max(1, Math.min(5, Number(config.liveProbeConcurrency || 2)));
@@ -71,12 +73,20 @@ export class LiveMonitor {
       mkdir(this.config.downloadDir, { recursive: true }),
     ]);
     // There is never a valid child recorder from a previous container instance.
-    await rm(this.cookiesDir, { recursive: true, force: true });
-    await mkdir(this.cookiesDir, { recursive: true, mode: 0o700 });
+    // Older builds left a runtime session copy inside the backed-up data mount.
+    await rm(this.legacyCookiesDir, { recursive: true, force: true });
     if (this.config.ytdlpCookiesFile) {
-      this.cookieCopy = path.join(this.cookiesDir, `cookies-${randomUUID()}.txt`);
-      await copyFile(this.config.ytdlpCookiesFile, this.cookieCopy);
-      await chmod(this.cookieCopy, 0o600);
+      this.cookiesDir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-live-cookies-'));
+      try {
+        this.cookieCopy = path.join(this.cookiesDir, `cookies-${randomUUID()}.txt`);
+        await copyFile(this.config.ytdlpCookiesFile, this.cookieCopy);
+        await chmod(this.cookieCopy, 0o600);
+      } catch (error) {
+        await rm(this.cookiesDir, { recursive: true, force: true });
+        this.cookiesDir = '';
+        this.cookieCopy = '';
+        throw error;
+      }
     }
     this.runtimeConfig = { ...this.config, liveCookiesFile: this.cookieCopy };
     this.running = true;
@@ -121,7 +131,8 @@ export class LiveMonitor {
     } finally {
       clearTimeout(deadline);
     }
-    if (this.cookieCopy) await rm(this.cookieCopy, { force: true });
+    if (this.cookiesDir) await rm(this.cookiesDir, { recursive: true, force: true });
+    this.cookiesDir = '';
     this.cookieCopy = '';
   }
 

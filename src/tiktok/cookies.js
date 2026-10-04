@@ -95,7 +95,12 @@ export function cookieHeaderForUrl(cookies, urlString, { includeTikTokSession } 
 
   const now = Date.now() / 1000;
   const host = url.hostname.toLowerCase();
-  const attachTikTokSession = includeTikTokSession ?? isTikTokRelatedHost(host);
+  // Metadata can contain third-party media URLs. Never send an authenticated
+  // TikTok jar to an untrusted host, even when a caller requests CDN cookies.
+  if (url.protocol !== 'https:' || url.username || url.password || url.port || !isTikTokRelatedHost(host)) {
+    return '';
+  }
+  const attachTikTokSession = includeTikTokSession ?? true;
   const selected = [];
   const seen = new Set();
 

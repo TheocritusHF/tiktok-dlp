@@ -42,10 +42,12 @@ test('parseNetscapeCookies reads Netscape rows and domain-matches TikTok hosts',
   assert.match(cdnHeader, /sessionid=test-session/);
   assert.doesNotMatch(cdnHeader, /unrelated=/);
 
-  const fallbackCdn = cookieHeaderForUrl(cookies, 'https://cdn.example.test/story.mp4', { includeTikTokSession: true });
-  assert.match(fallbackCdn, /sessionid=test-session/);
-
+  assert.equal(cookieHeaderForUrl(cookies, 'https://cdn.example.test/story.mp4', { includeTikTokSession: true }), '');
   assert.equal(cookieHeaderForUrl(cookies, 'https://cdn.example.test/image.jpg'), '');
+  assert.equal(cookieHeaderForUrl(cookies, 'http://www.tiktok.com/image.jpg', { includeTikTokSession: true }), '');
+  assert.equal(cookieHeaderForUrl(cookies, 'https://www.tiktok.com:8443/image.jpg', { includeTikTokSession: true }), '');
+  assert.equal(cookieHeaderForUrl(cookies, 'https://tiktok.com.example.test/image.jpg', { includeTikTokSession: true }), '');
+  assert.equal(cookieHeaderForUrl(cookies, 'https://example.com/image.jpg', { includeTikTokSession: true }), '');
 });
 
 test('assertCookiesFileConfigured fails closed when the env path is missing or empty', async () => {

@@ -49,7 +49,7 @@ def fresh_uuids():
 
 
 def ensure_device_settings(device_file):
-    """Load persisted instagrapi settings, creating a stable device once."""
+    """Load only the stable device profile, removing legacy saved sessions."""
     path = Path(device_file)
     if path.is_file():
         try:
@@ -57,7 +57,10 @@ def ensure_device_settings(device_file):
             if isinstance(data, dict) and isinstance(data.get("uuids"), dict) and isinstance(
                 data.get("device_settings"), dict
             ):
-                return data
+                device = device_only_settings(data)
+                if data != device:
+                    save_device_settings(device_file, device)
+                return device
         except (OSError, ValueError):
             pass
     settings = {"uuids": fresh_uuids(), "device_settings": dict(STABLE_DEVICE_SETTINGS)}
@@ -65,15 +68,23 @@ def ensure_device_settings(device_file):
     return settings
 
 
+def device_only_settings(settings):
+    """Session cookies and authorization data belong in the separate cookie jar."""
+    return {
+        "uuids": dict(settings["uuids"]),
+        "device_settings": dict(settings["device_settings"]),
+    }
+
+
 def save_device_settings(device_file, settings):
-    """Atomically persist instagrapi settings with owner-only permissions."""
+    """Atomically persist device identity only, with owner-only permissions."""
     path = Path(device_file)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".ig-device-")
         try:
             with os.fdopen(fd, "w") as handle:
-                json.dump(settings, handle)
+                json.dump(device_only_settings(settings), handle)
             os.chmod(tmp_name, 0o600)
             os.replace(tmp_name, path)
         except BaseException:

@@ -69,6 +69,33 @@ test('LIVE metadata requires confirmed live state and numeric room ID', () => {
   assert.equal(formatLiveDuration(3_661), '1h 1m');
 });
 
+test('LIVE runtime cookie copy stays outside backed-up data and is removed on stop', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'live-cookie-privacy-'));
+  const source = path.join(dir, 'tiktok.txt');
+  await writeFile(source, 'synthetic-session');
+  const oldDir = path.join(dir, 'live', 'private-cookies');
+  await mkdir(oldDir, { recursive: true });
+  await writeFile(path.join(oldDir, 'old.txt'), 'old-synthetic-session');
+  const monitor = new LiveMonitor({
+    store: { ...fakeStore(), listWatches: () => [] },
+    config: { ...config(dir), ytdlpCookiesFile: source },
+    logger: quietLogger,
+  });
+  try {
+    await monitor.start();
+    assert.ok(monitor.cookieCopy.startsWith(`${os.tmpdir()}${path.sep}`));
+    assert.ok(!monitor.cookieCopy.startsWith(`${dir}${path.sep}`));
+    assert.equal(await readFile(monitor.cookieCopy, 'utf8'), 'synthetic-session');
+    await assert.rejects(stat(oldDir), { code: 'ENOENT' });
+    const copied = monitor.cookieCopy;
+    await monitor.stop();
+    await assert.rejects(stat(copied), { code: 'ENOENT' });
+  } finally {
+    await monitor.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('LIVE is disabled by default and configuration is opt-in', () => {
   const defaults = loadConfig({}, '/tmp');
   assert.equal(defaults.liveEnabled, false);

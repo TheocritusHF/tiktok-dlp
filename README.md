@@ -555,6 +555,16 @@ cookies. yt-dlp `--cookies` rewrites its cookie file and can drop `sessionid`;
 the bot copies the jar to a writable temp file for each yt-dlp run and leaves
 the mounted original intact.
 
+Authenticated photo and Story fallback requests attach TikTok cookies only to
+HTTPS TikTok and known TikTok media hosts. A media URL on another host is fetched
+without the TikTok cookie jar. The LIVE worker keeps its runtime cookie copy in
+the container's temporary directory and removes the older `data/live/private-cookies`
+directory on startup. The Instagram private lister persists only device identity
+in `data/instagram-device.json`; its next run rewrites older settings files that
+also contained session cookies or authorization data. Existing archive backups
+may still contain those old files. Review or remove such backups according to
+your retention policy, and rotate affected sessions if the backups were shared.
+
 Export with a browser extension or follow the yt-dlp wiki Netscape format:
 https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp
 The cookie account must already be able to play the post in a browser. Direct
