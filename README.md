@@ -1,12 +1,12 @@
 # tiktok-dlp
 
-> **Combined fork preview:** This branch integrates upstream proposals
-> [#23–#29](RELEASE_PREVIEW.md) for use together. See the
-> [preview installation guide](RELEASE_PREVIEW.md) for setup and feature
-> settings. The fixed snapshot is
-> [`v0.1.0-preview.2`](https://github.com/TheocritusHF/tiktok-dlp/releases/tag/v0.1.0-preview.2).
-> The branch is separate from the fork's default `main`. Optional recording, quality, and notification features remain off
-> until configured.
+> **Fork integration:** This checkout combines proposals
+> [#23–#29](RELEASE_PREVIEW.md) with recent upstream changes. See the
+> [installation guide](RELEASE_PREVIEW.md) for setup and feature settings.
+> The [`v0.1.0-preview.2`](https://github.com/TheocritusHF/tiktok-dlp/releases/tag/v0.1.0-preview.2)
+> tag is an earlier fixed snapshot; check the branch commit for the current
+> integration. Optional recording, quality, and notification features remain
+> off until configured.
 
 Self-hosted social-media downloader and archive for TikTok, Instagram, and X,
 with TikTok monitoring and full-profile imports plus **Rewind**: a private,
