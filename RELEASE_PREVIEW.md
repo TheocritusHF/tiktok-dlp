@@ -1,11 +1,11 @@
-# Combined fork preview
+# TheocritusHF fork installation
 
-This fork combines proposals from seven upstream pull requests with the
-upstream changes tested in this integration. The `release/combined-preview`
-branch tracks the current installable checkout. The
-[`v0.1.0-preview.2`](https://github.com/TheocritusHF/tiktok-dlp/releases/tag/v0.1.0-preview.2)
-tag remains an earlier fixed snapshot; inspect the branch commit before
-deploying a newer checkout. This is a fork integration, not an upstream release.
+[`v1.0.0`](https://github.com/TheocritusHF/tiktok-dlp/releases/tag/v1.0.0)
+is the first fixed full release of this fork. It combines proposals from seven
+upstream pull requests with tested upstream changes. The
+`release/combined-preview` branch can advance after the tag, so use the tag
+when you want the exact v1.0.0 source. This is a fork release, independent of
+upstream's releases.
 
 | Area | Upstream proposal | Enabled by default? |
 | --- | --- | --- |
@@ -26,10 +26,13 @@ individual proposals is tracked on their PR pages.
 These PowerShell steps use a new directory and do not change another checkout:
 
 ```powershell
-git clone --branch release/combined-preview --single-branch https://github.com/TheocritusHF/tiktok-dlp.git tiktok-dlp-combined-preview
-Set-Location tiktok-dlp-combined-preview
+git clone --branch v1.0.0 --depth 1 https://github.com/TheocritusHF/tiktok-dlp.git tiktok-dlp-fork-v1
+Set-Location tiktok-dlp-fork-v1
 Copy-Item .env.example .env
 ```
+
+To follow the moving integration branch instead, replace `v1.0.0` in the
+clone command with `release/combined-preview`.
 
 Edit `.env` and supply your own `DISCORD_TOKEN`, `DISCORD_CLIENT_ID`,
 `PUBLIC_BASE_URL`, `REWIND_PUBLIC_URL`, and a fresh `IMPORT_API_TOKEN`.
@@ -99,7 +102,7 @@ project's [backup and recovery instructions](README.md#backups-and-recovery)
 when moving an existing archive. Do not point two running checkouts at the
 same SQLite database or downloads directory.
 
-This branch can be updated as upstream and the individual proposals change.
-The `v0.1.0-preview.2` and `v0.1.0-preview.1` tags remain fixed at their
-original commits; neither tag contains this newer integration. Compare the
-branch commit with your deployed version before updating an existing archive.
+The `v1.0.0` tag is fixed. The `release/combined-preview` branch may gain
+later changes, while the older `v0.1.0-preview.1` and `v0.1.0-preview.2`
+tags remain at their original commits. Compare the exact commit with your
+deployed version before updating an existing archive.
