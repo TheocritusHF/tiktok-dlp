@@ -86,8 +86,10 @@ separate [installation guide](https://github.com/TheocritusHF/tiktok-dlp/blob/re
 The Docker backend test run passed 337 tests with one skip, and the live trial
 confirmed quality upgrades, Discord notifications, and LIVE recording. The
 [`v1.0.0`](https://github.com/TheocritusHF/tiktok-dlp/releases/tag/v1.0.0)
-tag is the first fixed full release of this fork. Earlier preview tags remain
-unchanged, and the branch may receive later changes. This is independent of
+tag is the first fixed full release of this fork. The
+[`v1.0.1`](https://github.com/TheocritusHF/tiktok-dlp/releases/tag/v1.0.1)
+patch release adds the privacy fixes. Earlier preview tags remain unchanged,
+and the branch may receive later changes. This is independent of
 upstream's releases. Its optional features remain disabled until configured.
 Back up an existing archive before upgrading, since #25 adds a SQLite migration.
 
