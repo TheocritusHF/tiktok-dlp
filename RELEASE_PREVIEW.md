@@ -1,11 +1,11 @@
 # TheocritusHF fork installation
 
-[`v1.0.0`](https://github.com/TheocritusHF/tiktok-dlp/releases/tag/v1.0.0)
-is the first fixed full release of this fork. It combines proposals from seven
-upstream pull requests with tested upstream changes. The
-`release/combined-preview` branch can advance after the tag, so use the tag
-when you want the exact v1.0.0 source. This is a fork release, independent of
-upstream's releases.
+[`v1.0.1`](https://github.com/TheocritusHF/tiktok-dlp/releases/tag/v1.0.1)
+is the current patch release of this fork. It builds on the first full v1.0.0
+release, combining seven upstream proposals with tested upstream changes and
+privacy fixes. The `release/combined-preview` branch can advance after the
+tag, so use the tag when you want the exact v1.0.1 source. This is a fork
+release, independent of upstream's releases.
 
 | Area | Upstream proposal | Enabled by default? |
 | --- | --- | --- |
@@ -26,12 +26,12 @@ individual proposals is tracked on their PR pages.
 These PowerShell steps use a new directory and do not change another checkout:
 
 ```powershell
-git clone --branch v1.0.0 --depth 1 https://github.com/TheocritusHF/tiktok-dlp.git tiktok-dlp-fork-v1
+git clone --branch v1.0.1 --depth 1 https://github.com/TheocritusHF/tiktok-dlp.git tiktok-dlp-fork-v1
 Set-Location tiktok-dlp-fork-v1
 Copy-Item .env.example .env
 ```
 
-To follow the moving integration branch instead, replace `v1.0.0` in the
+To follow the moving integration branch instead, replace `v1.0.1` in the
 clone command with `release/combined-preview`.
 
 Edit `.env` and supply your own `DISCORD_TOKEN`, `DISCORD_CLIENT_ID`,
@@ -102,7 +102,7 @@ project's [backup and recovery instructions](README.md#backups-and-recovery)
 when moving an existing archive. Do not point two running checkouts at the
 same SQLite database or downloads directory.
 
-The `v1.0.0` tag is fixed. The `release/combined-preview` branch may gain
-later changes, while the older `v0.1.0-preview.1` and `v0.1.0-preview.2`
-tags remain at their original commits. Compare the exact commit with your
+The `v1.0.0` and `v1.0.1` tags are fixed. The `release/combined-preview`
+branch may gain later changes, while the older `v0.1.0-preview.1` and
+`v0.1.0-preview.2` tags remain at their original commits. Compare the exact commit with your
 deployed version before updating an existing archive.
