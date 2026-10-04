@@ -6,9 +6,85 @@ to fetch posts/stories/highlights via i.instagram.com.
 """
 import argparse
 import json
+import os
 import re
+import secrets
 import sys
+import tempfile
+import uuid
 from pathlib import Path
+
+DEFAULT_DEVICE_FILE = os.environ.get(
+    "INSTAGRAM_DEVICE_FILE", "/app/data/instagram-device.json"
+)
+
+# One stable, plausible device fingerprint. instagrapi generates a RANDOM
+# device on every Client() by default, which makes each monitor poll look like
+# a brand-new-device login — a fast track to 467 challenges. Pinning one
+# device makes repeat logins look like the same phone coming back.
+STABLE_DEVICE_SETTINGS = {
+    "app_version": "341.0.0.34.109",
+    "android_version": 33,
+    "android_release": "13.0.0",
+    "dpi": "420dpi",
+    "resolution": "1080x2286",
+    "manufacturer": "Google",
+    "device": "Pixel 6",
+    "model": "Pixel 6",
+    "cpu": "qcom",
+    "version_code": "567191384",
+}
+
+
+def fresh_uuids():
+    return {
+        "phone_id": str(uuid.uuid4()),
+        "uuid": str(uuid.uuid4()),
+        "client_session_id": str(uuid.uuid4()),
+        "advertising_id": str(uuid.uuid4()),
+        "android_device_id": "android-" + secrets.token_hex(8),
+        "request_id": str(uuid.uuid4()),
+        "tray_session_id": str(uuid.uuid4()),
+    }
+
+
+def ensure_device_settings(device_file):
+    """Load persisted instagrapi settings, creating a stable device once."""
+    path = Path(device_file)
+    if path.is_file():
+        try:
+            data = json.loads(path.read_text())
+            if isinstance(data, dict) and isinstance(data.get("uuids"), dict) and isinstance(
+                data.get("device_settings"), dict
+            ):
+                return data
+        except (OSError, ValueError):
+            pass
+    settings = {"uuids": fresh_uuids(), "device_settings": dict(STABLE_DEVICE_SETTINGS)}
+    save_device_settings(device_file, settings)
+    return settings
+
+
+def save_device_settings(device_file, settings):
+    """Atomically persist instagrapi settings with owner-only permissions."""
+    path = Path(device_file)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".ig-device-")
+        try:
+            with os.fdopen(fd, "w") as handle:
+                json.dump(settings, handle)
+            os.chmod(tmp_name, 0o600)
+            os.replace(tmp_name, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+    except OSError as e:
+        print(json.dumps({"error": f"cannot persist device settings: {e}"}))
+        sys.exit(1)
 
 def extract_sessionid(cookies_path: str) -> str:
     text = Path(cookies_path).read_text(errors="ignore")
@@ -21,13 +97,23 @@ def extract_sessionid(cookies_path: str) -> str:
         raise SystemExit(f"sessionid not found in {cookies_path}")
     return m.group(1).strip()
 
+def stop_on_private_exception(client, error):
+    # instagrapi otherwise tries to resolve challenges and resends the request.
+    # Leave account security prompts to the owner in the official app.
+    raise error
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--handle", required=True, help="Instagram handle without @")
     p.add_argument("--type", required=True, choices=["posts", "stories", "highlights"])
     p.add_argument("--limit", type=int, default=5)
     p.add_argument("--cookies", default="/app/cookies/instagram.txt")
+    p.add_argument("--device-file", default=DEFAULT_DEVICE_FILE)
+    p.add_argument("--user-id", default="", help="Creator ID resolved earlier in this poll")
     args = p.parse_args()
+    if args.user_id and not re.fullmatch(r"[1-9][0-9]*", args.user_id):
+        p.error("invalid user ID")
 
     handle = args.handle.strip().lower().replace("@", "")
     if not re.match(r"^[a-z0-9._]{1,30}$", handle) or ".." in handle:
@@ -42,35 +128,44 @@ def main():
 
     try:
         from instagrapi import Client
-        from instagrapi.exceptions import ClientError
     except ImportError as e:
         print(json.dumps({"error": f"instagrapi not installed: {e}"}))
         sys.exit(1)
 
-    cl = Client()
-    # Reduce retries and set timeout
-    cl.request_timeout = 15
+    cl = Client(ensure_device_settings(args.device_file))
+    cl.handle_exception = stop_on_private_exception
     try:
         cl.login_by_sessionid(sessionid)
     except Exception as e:
-        print(json.dumps({"error": f"login_by_sessionid failed: {e}", "kind": "access_denied"}))
+        print(json.dumps({"error": f"login_by_sessionid failed: {e}", "kind": "access_denied", "stage": "login"}))
         sys.exit(1)
+    try:
+        save_device_settings(args.device_file, cl.get_settings())
+    except SystemExit:
+        raise
+    except Exception:
+        pass  # Listings matter more than refreshing the persisted session.
 
     try:
-        user = cl.user_info_by_username(handle)
-        user_id = str(user.pk)
+        # v1 private lookup directly: user_id_from_username() routes through
+        # the public GraphQL path first and hangs retrying it when the web
+        # tier rejects automated access.
+        user_id = args.user_id or str(cl.user_info_by_username_v1(handle).pk)
     except Exception as e:
         # Try to give a clear kind for monitor backoff
         msg = str(e).lower()
         kind = "not_found" if "not found" in msg or "user not found" in msg else "access_denied" if "login" in msg else "private_error"
-        print(json.dumps({"error": f"user lookup failed for {handle}: {e}", "kind": kind}))
+        print(json.dumps({"error": f"user lookup failed for {handle}: {e}", "kind": kind, "stage": "lookup"}))
         sys.exit(1)
 
     entries = []
     try:
         if args.type == "posts":
-            # user_medias includes photos, videos, carousels
-            medias = cl.user_medias(user_id, amount=args.limit)
+            # user_medias includes photos, videos, carousels.
+            # Call the v1 private endpoint directly: the dispatcher tries the
+            # public GraphQL path first and hangs retrying it when the web
+            # tier rejects automated access.
+            medias = cl.user_medias_v1(user_id, amount=args.limit)
             for m in medias[: args.limit]:
                 # m.code is shortcode, m.pk is numeric id, m.taken_at is datetime
                 code = getattr(m, "code", "") or str(getattr(m, "pk", ""))
@@ -109,17 +204,9 @@ def main():
                     "caption_text": getattr(m, "caption_text", ""),
                 })
         elif args.type == "stories":
-            # user_stories returns list of Story objects
-            try:
-                stories = cl.user_stories(user_id)
-            except Exception as e:
-                # Fallback to private reels_media
-                stories = []
-                # Try alternative
-                try:
-                    stories = cl.story_medias(user_id)  # may not exist
-                except:
-                    pass
+            # user_stories returns list of Story objects.
+            # v1 private endpoint directly (see posts comment above).
+            stories = cl.user_stories_v1(user_id, amount=args.limit)
             for s in stories[: args.limit]:
                 # s.pk is media_id, s.taken_at, s.media_type
                 pk = str(getattr(s, "pk", "") or getattr(s, "id", ""))
@@ -208,7 +295,7 @@ def main():
     except Exception as e:
         msg = str(e).lower()
         kind = "rate_limited" if "429" in msg or "throttled" in msg else "not_found" if "not found" in msg else "private_error"
-        print(json.dumps({"error": f"{args.type} fetch failed for {handle}: {e}", "kind": kind}))
+        print(json.dumps({"error": f"{args.type} fetch failed for {handle}: {e}", "kind": kind, "stage": args.type}))
         sys.exit(1)
 
     # Build metadata

@@ -23,8 +23,8 @@ mutations.
 
 The feed preserves original descriptions and hashtags, uses the post date when
 a video has no caption, and supports exact video links. Live feed records load
-in bounded pages; only seven nearby cards and at most the active and next two
-media streams are mounted. Bookmarks are server-backed and existing local
+in bounded pages; only seven nearby cards and three adjacent video players
+are mounted, with one incoming neighbor warmed at a time. Bookmarks are server-backed and existing local
 bookmarks migrate once; playback settings remain local to the browser.
 
 The bottom progress bar supports pointer and keyboard seeking. Desktop shortcuts
@@ -52,7 +52,8 @@ automatic retention cleanup handles permanent removal without a Media UI action.
 
 ## Local development
 
-Requires Node.js `>=22.13.0`.
+Requires Node.js `>=22.13.0`. Live playback and conversion tests also require
+`ffmpeg` and `ffprobe` with `libx264`, `libx265`, `zscale`, and `tonemap` support.
 
 ```bash
 npm install
@@ -74,7 +75,10 @@ critical feed controls, video/post cursor contracts, safe archive paths, ordered
 media serving, and live thumbnail-sidecar behavior. The Chromium workflow
 covers desktop and mobile navigation, accessibility, mixed-media interactions,
 destructive confirmations, and explicit profile linking; CI installs the
-browser bundle before running it.
+browser bundle before running it. The real-playback regression also requires
+`ffmpeg` with the `libx264` encoder (installed by CI). It generates a short
+video and verifies decoding, seeking, and buffer retention across swipes;
+Chromium runs that test with network and CPU throttling.
 
 ## Live preview over SSH
 
@@ -128,6 +132,23 @@ That command runs:
 
 The service mounts `data` read-only. Imports and deletions go through the
 backend on the private Docker network using `IMPORT_API_TOKEN`.
+
+Versioned playback URLs prepare H.264/AAC faststart copies of incompatible
+video sources and files above 2.2 Mbps total bitrate, including HDR-to-SDR tone
+mapping where needed. Compatible MP4/H.264/AAC files at or below that rate pass
+through, as do compatible files whose bitrate cannot be determined. Downloads
+always retain the original bytes. The first request for an uncached playback
+copy can take seconds to over a minute to encode. Conversion runs one at a time
+with a bounded queue; it never delays archive-list responses. Copies and
+thumbnails share `.live-cache`, persisted by Compose in the `rewind-live-cache`
+volume and bounded to 5 GiB by default. Prepared playback copies do not expire
+by age; thumbnails and cached originals expire after seven days. Size pressure
+can evict the oldest inactive files, including playback copies. Clearing the
+volume forces regeneration without affecting the archive.
+
+The public playback policy version changes independently of the encoding
+version, so a policy update can reuse existing copies without serving cached
+original video bytes under the new playback URL.
 
 Set the public origin and start the Cloudflare profile from the repository root:
 

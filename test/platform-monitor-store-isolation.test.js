@@ -3,7 +3,127 @@ import test from 'node:test';
 import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { createStore } from '../src/state/store.js';
+import { createStore, Store } from '../src/state/store.js';
+
+test('watch reads preserve platform isolation and prefer guild subscriptions over legacy channels', () => {
+  const store = new Store(':memory:');
+  try {
+    for (const platform of ['tiktok', 'instagram']) {
+      store.addWatch('creator', { platform, channelId: 'legacy-channel' }, 1000);
+      store.addWatch('creator', { platform, guildId: 'guild-1', channelId: `${platform}-channel` }, 2000);
+      store.addWatch('creator', { platform, guildId: 'guild-2', channelId: 'other-channel' }, 3000);
+    }
+    assert.equal(store.getWatch('creator').platform, 'tiktok');
+    assert.equal(store.getWatch('creator', { platform: 'instagram' }).platform, 'instagram');
+    assert.equal(store.getWatch('creator', 'x'), null);
+    assert.deepEqual(store.listWatches('instagram'), store.listWatches({ platform: 'instagram' }));
+    assert.deepEqual(store.listWatches().map((watch) => watch.platform), ['instagram', 'tiktok']);
+
+    const scope = { guildId: 'guild-1', channelId: 'legacy-channel' };
+    assert.deepEqual(store.listWatchesForScope(scope).map((watch) => watch.subscription_channel_id), ['instagram-channel', 'tiktok-channel']);
+    const instagram = store.listWatchesForScope({ ...scope, platform: 'instagram' });
+    assert.equal(instagram.length, 1);
+    assert.equal(instagram[0].subscription_channel_id, 'instagram-channel');
+    assert.deepEqual(store.listWatchesForScope({ ...scope, platform: 'x' }), []);
+    assert.equal(store.getWatchSubscription('creator', { guildId: 'guild-1', platform: 'instagram' }).channel_id, 'instagram-channel');
+    assert.equal(store.getWatchSubscription('creator', { guildId: 'guild-1', platform: 'x' }), null);
+    assert.equal(store.listWatchSubscriptions('creator').length, 6);
+    assert.equal(store.listWatchSubscriptions('creator', 'instagram').length, 3);
+    assert.deepEqual(store.listWatchSubscriptions('creator', 'x'), []);
+
+    store.db.exec('DROP TABLE watch_subscriptions');
+    assert.throws(() => store.listWatchesForScope({ ...scope, platform: 'instagram' }), /no such table/);
+  } finally {
+    store.close();
+  }
+});
+
+test('removing a watch preserves other platforms and remaining guild subscriptions', () => {
+  const store = new Store(':memory:');
+  try {
+    for (const platform of ['tiktok', 'instagram']) {
+      for (const guildId of ['guild-1', 'guild-2']) {
+        store.addWatch('creator', { platform, guildId, channelId: 'channel-1' }, 1000);
+      }
+    }
+    const instagram = store.getWatch('creator', 'instagram');
+    assert.equal(store.removeWatch('creator'), true);
+    assert.equal(store.removeWatch('creator'), false);
+    assert.equal(store.getWatch('creator'), null);
+    assert.deepEqual(store.listWatchSubscriptions('creator', 'tiktok'), []);
+    assert.deepEqual(store.getWatch('creator', 'instagram'), instagram);
+    assert.equal(store.listWatchSubscriptions('creator', 'instagram').length, 2);
+    assert.equal(store.removeWatch('creator', { platform: 'instagram', guildId: 'guild-1' }), true);
+    assert.deepEqual(store.getWatch('creator', 'instagram'), instagram);
+    assert.equal(store.listWatchSubscriptions('creator', 'instagram').length, 1);
+    assert.equal(store.removeWatch('creator', { platform: 'instagram', guildId: 'guild-2' }), true);
+    assert.equal(store.getWatch('creator', 'instagram'), null);
+  } finally {
+    store.close();
+  }
+});
+
+test('poll outcomes only update the requested platform, including when its watch is missing', () => {
+  const store = new Store(':memory:');
+  try {
+    for (const platform of ['tiktok', 'instagram']) {
+      store.addWatch('creator', { platform, channelId: 'channel-1' }, 1000);
+    }
+    const initialTikTok = store.getWatch('creator', 'tiktok');
+    store.markWatchFailure('creator', 'failed', 3000, 2000, 'instagram');
+    assert.equal(store.getWatch('creator', 'instagram').failure_count, 1);
+    assert.deepEqual(store.getWatch('creator', 'tiktok'), initialTikTok);
+    store.markWatchSuccess('creator', 4000, 5000, 'instagram');
+    const instagram = store.getWatch('creator', 'instagram');
+    assert.equal(instagram.failure_count, 0);
+    assert.equal(instagram.last_error, null);
+    assert.equal(instagram.last_success_at, 4000);
+    assert.equal(instagram.next_check_at, 5000);
+    assert.deepEqual(store.getWatch('creator', 'tiktok'), initialTikTok);
+
+    store.markWatchFailure('creator', 'missing watch', 6000, 5000, 'x');
+    store.markWatchSuccess('creator', 6000, 7000, 'x');
+    assert.deepEqual(store.getWatch('creator', 'instagram'), instagram);
+    assert.deepEqual(store.getWatch('creator', 'tiktok'), initialTikTok);
+
+    store.markWatchFailure('creator', 'legacy caller', 8000, 7000);
+    assert.equal(store.getWatch('creator', 'tiktok').failure_count, 1);
+    store.markWatchSuccess('creator', 8000, 9000);
+    assert.equal(store.getWatch('creator', 'tiktok').last_success_at, 8000);
+    assert.deepEqual(store.getWatch('creator', 'instagram'), instagram);
+  } finally {
+    store.close();
+  }
+});
+
+test('highlight outcomes remain scoped and database errors propagate', () => {
+  const store = new Store(':memory:');
+  try {
+    for (const platform of ['tiktok', 'instagram']) {
+      store.addWatch('creator', { platform, channelId: 'channel-1' }, 1000);
+    }
+    const initialTikTok = store.getWatch('creator', 'tiktok');
+    store.markHighlightCheckFailure('creator', 'instagram', 'failed', 3000, 2000);
+    assert.equal(store.getWatch('creator', 'instagram').highlight_failure_count, 1);
+    store.markHighlightCheckSuccess('creator', 'instagram', 4000, 5000);
+    assert.equal(store.getWatch('creator', 'instagram').highlight_failure_count, 0);
+    assert.equal(store.getWatch('creator', 'instagram').next_highlight_check_at, 5000);
+    assert.deepEqual(store.getWatch('creator', 'tiktok'), initialTikTok);
+
+    store.db.exec(`
+      CREATE TRIGGER reject_instagram_update BEFORE UPDATE ON watched_users
+      WHEN OLD.platform = 'instagram'
+      BEGIN SELECT RAISE(FAIL, 'write rejected'); END;
+    `);
+    assert.throws(() => store.markWatchSuccess('creator', 6000, 7000, 'instagram'), /write rejected/);
+    assert.throws(() => store.markWatchFailure('creator', 'failed', 7000, 6000, 'instagram'), /write rejected/);
+    assert.throws(() => store.markHighlightCheckSuccess('creator'), /write rejected/);
+    assert.throws(() => store.markHighlightCheckFailure('creator'), /write rejected/);
+    assert.deepEqual(store.getWatch('creator', 'tiktok'), initialTikTok);
+  } finally {
+    store.close();
+  }
+});
 
 test('Instagram and X files cannot make a TikTok seen post eligible for deletion checks', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'media-archive-monitor-platform-'));
@@ -134,3 +254,13 @@ function createTestFile(store, dir, platform, videoId, filename, now) {
     sizeBytes: 1,
   }, now);
 }
+
+test('monitor download failures retain their platform across retries', () => {
+  const store = new Store(':memory:');
+  try {
+    const record = { videoId: 'story_123', username: 'creator', platform: 'instagram', sourceUrl: 'https://www.instagram.com/stories/creator/123/' };
+    assert.equal(store.recordMonitorDownloadFailure(record, 5, 1000).platform, 'instagram');
+    assert.equal(store.recordMonitorDownloadFailure({ videoId: 'story_123', error: 'again' }, 5, 2000).platform, 'instagram');
+    assert.equal(store.recordMonitorDownloadFailure({ videoId: '123', username: 'creator' }, 5, 1000).platform, 'tiktok');
+  } finally { store.close(); }
+});

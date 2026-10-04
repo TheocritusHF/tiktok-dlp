@@ -181,7 +181,7 @@ test('adapter registry rejects duplicate platforms and host ownership', () => {
 test('the TikTok adapter owns direct-save, creator, story, and availability operations', async () => {
   const adapter = getPlatformAdapter('tiktok');
   assert.equal(adapter.capabilities.directDownload, true);
-  assert.equal(adapter.capabilities.probeBeforeDownload, true);
+  assert.equal(adapter.capabilities.probeBeforeDownload, false);
   assert.equal(adapter.capabilities.preferRequestedCreatorHandle, true);
   for (const operation of [
     'probe',

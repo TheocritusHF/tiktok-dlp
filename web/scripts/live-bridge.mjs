@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { pipeline } from "node:stream/promises";
+import { PLAYBACK_VERSION, playbackCachePath, preparePlayback } from "./playback-cache.mjs";
 import {
   MAX_PAGINATED_VIDEO_LIMIT,
   MAX_PAGINATED_POST_LIMIT,
@@ -46,9 +47,13 @@ const cacheMaxAgeMs = positiveInteger(process.env.LIVE_CACHE_MAX_AGE_DAYS, 7) * 
 const archiveRowCacheTtlMs = 30_000;
 const inflightCopies = new Map();
 const inflightThumbnails = new Map();
+const inflightPlayback = new Map();
+const playbackPaths = createBoundedRowCache(10_000);
 const activeCacheFiles = createActiveFileTracker();
 const limitVideoCopies = createTaskLimiter(2);
 const limitThumbnailGeneration = createTaskLimiter(2);
+const limitPlaybackEncoding = createTaskLimiter(1);
+let pendingPlaybackEncodes = 0;
 let videoCache = { loadedAt: 0, rows: [] };
 let videoCacheLoadPromise = null;
 const videoRowsById = createBoundedRowCache(10_000, { ttlMs: archiveRowCacheTtlMs });
@@ -173,9 +178,10 @@ const server = http.createServer(async (request, response) => {
         : rows;
       const uniqueRows = [...new Map(filtered.map((row) => [String(row.id), row])).values()];
       const pageRows = uniqueRows.slice(0, limit);
-      const items = pageRows.map((row) => (
-        toVideo(row, request, metadataById[String(row.video_id || "")] || {})
-      ));
+      // Keep the cursor on the archive boundary even when a slideshow soundtrack is omitted.
+      const items = pageRows
+        .filter((row) => metadataById[String(row.video_id || "")]?.vcodec !== "none")
+        .map((row) => toVideo(row, request, metadataById[String(row.video_id || "")] || {}));
       if (paginated) {
         sendJson(response, 200, {
           items,
@@ -447,7 +453,10 @@ const server = http.createServer(async (request, response) => {
     if (isClientDisconnect(error, request, response)) return;
     console.error("[live-bridge]", error);
     if (!response.headersSent) {
-      if (isTrashSchemaMigrationError(error)) {
+      if (error?.statusCode === 503) {
+        response.setHeader("Retry-After", "3");
+        sendJson(response, 503, { error: error.message });
+      } else if (isTrashSchemaMigrationError(error)) {
         sendJson(response, 503, {
           error: "The archive database is being upgraded. Retry in a moment.",
         });
@@ -520,6 +529,7 @@ async function scanMetadataIndex() {
     "            'description': str(data.get('description') or ''),",
     "            'tags': raw_tags if isinstance(raw_tags, list) else [],",
     "            'duration': data.get('duration'),",
+    "            'vcodec': data.get('vcodec'),",
     "            'timestamp': data.get('timestamp'),",
     "        }",
     "print(json.dumps(result, ensure_ascii=False))",
@@ -582,26 +592,55 @@ async function serveStoredMedia(request, response, record, {
 
   const expectedPath = localMode ? resolveArchivePath(record.path) : videoCachePath(record);
   const releaseCacheFile = markActiveCacheFile(expectedPath);
+  let releasePlaybackFile = () => {};
   try {
-    const localPath = await ensureCached(record);
-    const fileStats = await stat(localPath);
-    const range = parseRange(request.headers.range, fileStats.size);
-    const modifiedAt = fileStats.mtime.toUTCString();
     const requestUrl = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
-    const wantsDownload = requestUrl.searchParams.get("download") === "1";
+    const wantsDownload = forceDownload || requestUrl.searchParams.get("download") === "1";
+    const playbackVersion = requestUrl.searchParams.get("playback");
+    if (!wantsDownload && playbackVersion === "1") {
+      // Keep changed media bytes on a distinct URL, including for retained tabs.
+      requestUrl.searchParams.set("playback", PLAYBACK_VERSION);
+      response.writeHead(307, {
+        Location: `${requestUrl.pathname}${requestUrl.search}`,
+        "Cache-Control": "no-store",
+        "Content-Length": "0",
+      });
+      response.end();
+      return;
+    }
+    if (!wantsDownload && playbackVersion && playbackVersion !== PLAYBACK_VERSION) {
+      sendJson(response, 400, { error: "Unsupported playback version" });
+      return;
+    }
+    let localPath = await ensureCached(record);
+    if (!wantsDownload && playbackVersion === PLAYBACK_VERSION && contentType.startsWith("video/")) {
+      const outputPath = playbackCachePath(cacheDir, localPath, await stat(localPath));
+      releasePlaybackFile = markActiveCacheFile(outputPath);
+      const sourcePath = localPath;
+      localPath = await ensurePlayback(sourcePath, outputPath, response);
+      if (localPath !== sourcePath) contentType = "video/mp4";
+    }
+    if (response.destroyed) return;
+    const fileStats = await stat(localPath);
+    const modifiedAt = fileStats.mtime.toUTCString();
     const headers = {
       "Accept-Ranges": "bytes",
       "Cache-Control": "private, max-age=604800, immutable, no-transform",
       "Content-Type": contentType,
-      ETag: `"${cacheRecordKey(record)}-${fileStats.size}-${Math.trunc(fileStats.mtimeMs)}"`,
+      ETag: `"${cacheRecordKey(record)}-${wantsDownload ? "original" : playbackVersion || "original"}-${fileStats.size}-${Math.trunc(fileStats.mtimeMs)}"`,
       "Last-Modified": modifiedAt,
     };
-    if (forceDownload || wantsDownload) {
+    const ifRange = request.headers["if-range"];
+    const requestedRange = !ifRange || ifRange === headers.ETag || ifRange === modifiedAt
+      ? request.headers.range
+      : undefined;
+    const range = parseRange(requestedRange, fileStats.size);
+    if (wantsDownload) {
       const filename = String(record.filename || `${record.id}.mp4`).replace(/["\\\r\n]/g, "_");
       headers["Content-Disposition"] = `attachment; filename="${filename}"`;
     }
 
-    if (range === null && request.headers.range) {
+    if (range === null && requestedRange) {
       response.writeHead(416, {
         ...headers,
         "Content-Range": `bytes */${fileStats.size}`,
@@ -634,7 +673,65 @@ async function serveStoredMedia(request, response, record, {
     }
     await pipeline(createReadStream(localPath), response);
   } finally {
+    releasePlaybackFile();
     releaseCacheFile();
+  }
+}
+
+async function ensurePlayback(sourcePath, outputPath, response) {
+  const cached = playbackPaths.get(outputPath);
+  if (cached) {
+    if (cached.path === sourcePath) return sourcePath;
+    try {
+      if ((await stat(cached.path)).size > 0) return cached.path;
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    playbackPaths.delete(outputPath);
+  }
+  let entry = inflightPlayback.get(outputPath);
+  if (!entry) {
+    entry = { responses: new Set(), controller: new AbortController(), encoding: false, promise: null };
+    entry.promise = preparePlayback(sourcePath, outputPath, {
+      runEncode: async (encode) => {
+        entry.controller.signal.throwIfAborted();
+        if (pendingPlaybackEncodes >= 3) {
+          throw Object.assign(new Error("Playback preparation is busy. Retry in a moment."), { statusCode: 503 });
+        }
+        pendingPlaybackEncodes += 1;
+        try {
+          return await limitPlaybackEncoding(() => {
+            entry.encoding = true;
+            return encode();
+          }, { signal: entry.controller.signal });
+        } finally {
+          pendingPlaybackEncodes -= 1;
+        }
+      },
+    }).then(async (preparedPath) => {
+      playbackPaths.add([{ id: outputPath, path: preparedPath }]);
+      if (preparedPath !== sourcePath) await pruneLiveCache();
+      return preparedPath;
+    }).finally(() => {
+      if (inflightPlayback.get(outputPath) === entry) inflightPlayback.delete(outputPath);
+    });
+    inflightPlayback.set(outputPath, entry);
+  }
+  entry.responses.add(response);
+  const onClose = () => {
+    entry.responses.delete(response);
+    if (!entry.responses.size && !entry.encoding) {
+      entry.controller.abort();
+      if (inflightPlayback.get(outputPath) === entry) inflightPlayback.delete(outputPath);
+    }
+  };
+  response.once("close", onClose);
+  if (response.destroyed) onClose();
+  try {
+    return await entry.promise;
+  } finally {
+    response.off("close", onClose);
+    entry.responses.delete(response);
   }
 }
 
@@ -680,9 +777,6 @@ async function serveThumbnail(request, response, fileId) {
 async function findVideoRow(fileId) {
   const indexed = videoRowsById.get(fileId);
   if (indexed) return indexed;
-  const rows = await loadVideoRows();
-  const cached = rows.find((row) => Number(row.id) === Number(fileId));
-  if (cached) return cached;
   const [exact] = await loadArchiveVideoRows({ fileId, limit: 1 });
   if (exact) videoRowsById.add([exact]);
   return exact || null;
@@ -1227,7 +1321,7 @@ function toVideo(row, request, metadata = {}) {
     description: originalDescription,
     tags: normalizeTags(metadata.tags, originalDescription),
     mediaType: "video",
-    videoUrl: `${origin}/media/${row.id}`,
+    videoUrl: `${origin}/media/${row.id}?playback=${PLAYBACK_VERSION}`,
     thumbnailUrl: `${origin}/thumbnail/${row.id}.jpg`,
     accent: creatorAccent(username),
     savedAt: new Date(createdAt).toISOString(),
@@ -1251,7 +1345,7 @@ function toPost(row, request) {
     position: Number(asset.position ?? index),
     kind: normalizedMediaKind(asset.kind, asset.mime_type, asset.filename),
     mimeType: safeMediaContentType(asset.mime_type, asset.filename),
-    mediaUrl: `${origin}/post-media/${row.id}/${index}`,
+    mediaUrl: `${origin}/post-media/${row.id}/${index}${safeMediaContentType(asset.mime_type, asset.filename).startsWith("video/") ? `?playback=${PLAYBACK_VERSION}` : ""}`,
     filename: String(asset.filename || `asset-${index + 1}`),
     sizeBytes: Number(asset.size_bytes || 0),
     width: asset.width == null ? null : Number(asset.width),
@@ -1459,6 +1553,7 @@ function createTaskLimiter(maxConcurrent) {
   function runNext() {
     while (active < limit && queue.length) {
       const entry = queue.shift();
+      entry.cleanup();
       active += 1;
       Promise.resolve()
         .then(entry.task)
@@ -1470,8 +1565,20 @@ function createTaskLimiter(maxConcurrent) {
     }
   }
 
-  return (task) => new Promise((resolve, reject) => {
-    queue.push({ task, resolve, reject });
+  return (task, { signal } = {}) => new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason);
+      return;
+    }
+    const abort = () => {
+      const index = queue.indexOf(entry);
+      if (index < 0) return;
+      queue.splice(index, 1);
+      reject(signal.reason);
+    };
+    const entry = { task, resolve, reject, cleanup: () => signal?.removeEventListener("abort", abort) };
+    signal?.addEventListener("abort", abort, { once: true });
+    queue.push(entry);
     runNext();
   });
 }

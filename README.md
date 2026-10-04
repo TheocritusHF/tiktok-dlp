@@ -1,5 +1,13 @@
 # tiktok-dlp
 
+> **Fork integration:** This checkout combines proposals
+> [#23–#29](RELEASE_PREVIEW.md) with recent upstream changes. See the
+> [installation guide](RELEASE_PREVIEW.md) for setup and feature settings.
+> The [`v0.1.0-preview.2`](https://github.com/TheocritusHF/tiktok-dlp/releases/tag/v0.1.0-preview.2)
+> tag is an earlier fixed snapshot; check the branch commit for the current
+> integration. Optional recording, quality, and notification features remain
+> off until configured.
+
 Self-hosted social-media downloader and archive for TikTok, Instagram, and X,
 with TikTok monitoring and full-profile imports plus **Rewind**: a private,
 mobile-first feed and dashboard for watching and managing saved videos.
@@ -12,25 +20,6 @@ surfaces, while Cloudflare Tunnel can expose tokenized downloads and a
 Cloudflare Access-protected archive.
 
 Implementation progress and remaining work are tracked in [WORKLOG.md](WORKLOG.md).
-
-> **Proposed from this fork:** [LIVE recording](https://github.com/nqrwhal/tiktok-dlp/pull/23),
-> [adaptive LIVE quality](https://github.com/nqrwhal/tiktok-dlp/pull/24),
-> [post quality rechecks](https://github.com/nqrwhal/tiktok-dlp/pull/25),
-> [dedicated Discord channels](https://github.com/nqrwhal/tiktok-dlp/pull/26),
-> [TikTok URL reliability](https://github.com/nqrwhal/tiktok-dlp/pull/27),
-> [webcast fallback and reconnects](https://github.com/nqrwhal/tiktok-dlp/pull/28), and
-> [TikTok photo Stories](https://github.com/nqrwhal/tiktok-dlp/pull/29)
-> are on separate feature branches. Their code is not in this default `main`
-> branch. The [fork roadmap](FORK_ROADMAP.md) lists branches, dependencies, and
-> optional settings; the PR pages show current review status.
-
-> **Want the features together?** The
-> [combined preview branch](https://github.com/TheocritusHF/tiktok-dlp/tree/release/combined-preview)
-> contains PRs #23–#29 in one checkout. Follow its
-> [installation guide](https://github.com/TheocritusHF/tiktok-dlp/blob/release/combined-preview/RELEASE_PREVIEW.md).
-> The current fixed snapshot is
-> [`v0.1.0-preview.2`](https://github.com/TheocritusHF/tiktok-dlp/releases/tag/v0.1.0-preview.2);
-> the branch may receive later changes.
 
 > [!IMPORTANT]
 > Optional, platform-specific Netscape cookies authenticate as a real account so
@@ -58,13 +47,16 @@ Implementation progress and remaining work are tracked in [WORKLOG.md](WORKLOG.m
 - Handles public photo/slideshow posts with a direct fallback and ZIP output.
   Configured cookies and the yt-dlp proxy are applied to those HTTP fallbacks.
 - Performs best-effort TikTok Story discovery and downloads, including an
-  authenticated session when cookies are configured.
+  authenticated session when cookies are configured. Photo Stories are saved
+  as image ZIPs and use the existing Story notification flow.
 - Monitors creators on a per-server or per-DM subscription basis.
 - Detects creator username changes and reports when saved source posts disappear.
 - Persists repeated monitor download failures as dead letters instead of marking
   those posts seen, with scoped Discord commands for inspection and manual retry.
 - Uses a bounded, deduplicated download queue with per-user and per-server limits.
 - Reuses immutable saved assets instead of downloading the same post repeatedly.
+- Optionally rechecks monitored TikTok video quality 6, 24 and 72 hours after
+  saving a post, replacing the archive only when FFprobe verifies an improvement.
 - Delivers small files through Discord and larger files through tokenized links.
 - Supports temporary links, extensions, permanent retention, history, and purge.
 
@@ -150,7 +142,7 @@ Recommended production setup:
 For direct local development:
 
 - Node.js `>=22.13.0`
-- `yt-dlp`, `gallery-dl` 1.32.10, and ffmpeg for backend download work
+- `yt-dlp`, `gallery-dl` 1.32.14, and ffmpeg for backend download work
 - Python 3 and ffmpeg for the live Rewind metadata and thumbnail fallbacks
 
 ## Quick start with Docker
@@ -327,6 +319,55 @@ Cancel or retry eligible jobs with `POST /api/imports/:id/cancel` and
 `POST /api/imports/:id/retry`. Cancellation is cooperative: an in-flight TikTok
 request finishes before the job stops.
 
+## Optional monitored video quality rechecks
+
+Set `QUALITY_UPGRADE_ENABLED=true` to recheck monitored TikTok video posts at
+6, 24 and 72 hours after they were first saved. The worker polls every 15
+minutes by default, so a due check can start later when the service is busy or
+offline. The schedule persists across restarts, and enabling the feature also
+enrolls eligible monitored posts saved in the previous 72 hours. Stories,
+slideshows and manual downloads are excluded.
+
+If a better format is advertised, the worker downloads it into an isolated
+temporary directory and uses FFprobe to verify that the recorded resolution
+is actually higher. It keeps a safety copy while replacing the archived MP4
+and updating the stored size and dimensions. The file path, archive file ID
+and existing download links stay the same. An unchanged check leaves the
+archived video in place. Failures attempt to restore the original from the
+safety copy, retaining that copy if recovery needs manual attention.
+Transient failures get one retry after an hour;
+the 72-hour check is final. The checks use extra TikTok requests and bandwidth.
+
+```dotenv
+QUALITY_UPGRADE_ENABLED=false
+QUALITY_UPGRADE_POLL_MINUTES=15
+QUALITY_UPGRADE_BATCH_SIZE=2
+```
+
+Quality rechecks are disabled by default. Changing these settings requires a
+backend restart. This feature adds a SQLite schema migration even while it is
+disabled, so back up the database before updating an existing installation.
+FFprobe must be available; the Docker image includes it. Successful upgrades
+are recorded in the backend logs. Set `DISCORD_QUALITY_UPGRADES_CHANNEL_ID` to
+also notify a dedicated channel after an improved file and database update
+succeed. Unchanged checks and failures do not send an upgrade notification.
+
+## Optional Discord archive channels
+
+Set `DISCORD_NEW_VIDEOS_CHANNEL_ID` and `DISCORD_NEW_STORIES_CHANNEL_ID` to
+send additional copies of new monitored TikTok post/slideshow and Story alerts
+to those channels. Existing account watch channels still receive their alerts.
+If the dedicated channel is the same as the account channel, the bot sends only
+one message. Empty settings leave the current routing unchanged. A dedicated
+channel only receives posts watched by a subscription in that same Discord
+server; DM-only watches are never copied into a server channel.
+
+Set `DISCORD_QUALITY_UPGRADES_CHANNEL_ID` for successful quality upgrades.
+The channel must be in a server that still watches the creator. Notification
+failures are logged and do not undo a committed upgrade. Give the bot permission
+to view and send messages in each configured channel. These settings are
+optional and take effect after a backend restart.
+
 ## Photo/slideshow resolver
 
 Follower-only photo posts are app-gated on the `/photo/{id}` web route, but the
@@ -418,9 +459,10 @@ still needs Cloudflare Access or an equivalent private access layer.
 
 | Area | Variables |
 | --- | --- |
-| Discord | `DISCORD_TOKEN`, `DISCORD_CLIENT_ID`, `DISCORD_OWNER_ID`, `WATCH_MANAGER_ROLE_ID`, `REGISTER_COMMANDS_ON_START` |
+| Discord | `DISCORD_TOKEN`, `DISCORD_CLIENT_ID`, `DISCORD_OWNER_ID`, `WATCH_MANAGER_ROLE_ID`, `DISCORD_NEW_VIDEOS_CHANNEL_ID`, `DISCORD_NEW_STORIES_CHANNEL_ID`, `DISCORD_QUALITY_UPGRADES_CHANNEL_ID`, `REGISTER_COMMANDS_ON_START` |
 | Public URLs | `PUBLIC_BASE_URL`, `REWIND_PUBLIC_URL`, `CLOUDFLARE_TUNNEL_TOKEN` |
 | Monitoring | `POLL_INTERVAL_SECONDS`, `PROFILE_SCAN_LIMIT`, `PROFILE_BURST_SCAN_LIMIT`, `MONITOR_CONCURRENCY` |
+| Optional quality rechecks | `QUALITY_UPGRADE_ENABLED`, `QUALITY_UPGRADE_POLL_MINUTES`, `QUALITY_UPGRADE_BATCH_SIZE` |
 | Queue limits | `MAX_CONCURRENT_DOWNLOADS`, `MAX_DOWNLOAD_QUEUE_SIZE`, `MAX_QUEUED_DOWNLOADS_PER_USER`, `MAX_QUEUED_DOWNLOADS_PER_GUILD` |
 | Imports | `IMPORT_API_TOKEN`, `IMPORT_MAX_DURATION_SECONDS`, `IMPORT_CONCURRENCY`, `IMPORT_PROFILE_TIMEOUT_SECONDS` |
 | Retention | `DOWNLOAD_LINK_TTL_MINUTES`, `RETENTION_DAYS`, `ARCHIVE_TRASH_RETENTION_DAYS`, `CLEANUP_BATCH_SIZE`, `CLEANUP_ORPHAN_GRACE_MINUTES` |
@@ -457,6 +499,40 @@ logged-in jar containing `sessionid`; the bot accepts only an exact
 download service now consumes these adapters
 and persists their ordered assets; Discord presentation can use the resulting
 post bundle or individual media files.
+
+Instagram monitor polls run no more often than every 15 minutes per creator
+(or the configured poll interval if longer), with one Instagram creator poll
+at a time. TikTok keeps its configured cadence. This reduces scheduled
+Instagram polls by about 93% compared with a one-minute interval; new posts
+and Stories can take up to 15 minutes to appear. Failed Instagram polls back
+off from 15 minutes to six hours, and failed Story checks are not treated as
+successful empty polls.
+
+Account-wide rate limits pause Instagram listings and extraction for six
+hours. Login failures, challenges, and account-review feedback pause them for
+24 hours. The pause is saved in `DATA_DIR/instagram-account-cooldown.json`, so
+restarting the bot or forcing a watch run does not bypass it. Instagram
+extractor requests have no immediate HTTP retries, and the gallery-dl
+fallback does not run during an account pause. The private client does not
+attempt to solve security challenges automatically. These are local conservative
+delays, not Instagram-provided recovery times or a guarantee against bans.
+Creator-specific permission failures remain isolated to that creator.
+
+Use an account whose loss would be acceptable, preserve its existing device
+settings and network route, and avoid repeated logouts, cookie refreshes, or
+manual force-runs when a restriction appears. Resolve security/account prompts
+in the official Instagram app, confirm ordinary browsing works, and let the
+pause expire before one verification attempt. Do not rotate accounts or routes
+to work around a restriction. Automated access can still lead to account
+restrictions; use an approved API/integration where it supports the needed
+content if account reliability is essential.
+
+The Docker build applies `scripts/patch-gallery-dl.py` to pinned gallery-dl
+1.32.14: Instagram merged-video variants may omit width/height, which are
+reported as unknown without changing the selected MP4. The build tests the
+real parser with missing and present dimensions and an image Story. The patch
+intentionally rejects a different gallery-dl version or source layout; review
+and remove it when upgrading to an upstream release that passes those cases.
 
 If TikTok requires a logged-in session, export a **full** Netscape `tiktok.com`
 cookie jar (not a hand-picked subset). The working live path needed
@@ -600,18 +676,20 @@ Pull requests and pushes to `main` run backend tests and syntax/contracts,
 Rewind lint/unit/integration/build checks, desktop and mobile Chromium
 workflows, Compose validation, and production builds for both images.
 
-A successful `main` workflow deploys its exact tested commit on the self-hosted
-runner labeled `yufeihl`; a later untested commit cannot be picked up by the
-same deployment. `scripts/deploy-prod.sh` builds the backend and Rewind while
-the old stack remains online, creates a verified SQLite backup, recreates both
-services together, and waits for dependency-aware health plus Discord login.
-The existing `cloudflared` container is left running. A stale workflow refuses
-to roll production backward if a newer commit is already deployed.
+GitHub deployment is manual on this fork. Pushing `main` runs CI but does not
+replace any running containers. The manual deployment workflow accepts an
+optional commit SHA on `main`, checks that it belongs to the current branch,
+and then runs `scripts/deploy-prod.sh`, which builds both images, creates a
+verified SQLite backup, recreates the services, and waits for their health
+checks. It does not deploy a newer untested commit in place of the requested
+SHA.
 
-Register the runner under repo **Settings → Actions → Runners**. Add the label
-`yufeihl` and use a work directory outside the production checkout, for example
-`~/actions-runner`. Keep `.env`, cookies, `data/`, and `.secrets/` on the host;
-they are not in git.
+The supplied workflow retains a Linux self-hosted runner label (`yufeihl`)
+and paths under `/home/yufei` from upstream. Configure those values and the
+Compose project name for your own Linux host before dispatching it. Windows
+Docker Desktop installations use the [installation guide](RELEASE_PREVIEW.md)
+and their local Compose configuration instead. Keep `.env`, cookies, `data/`,
+and `.secrets/` outside git.
 
 ## Operational notes
 
@@ -626,7 +704,137 @@ they are not in git.
   and `/ready` report the current database schema version.
 - Watched creator identity data caches TikTok `secUid` and author IDs when
   available.
+- Flat TikTok playlist entries may contain only a post ID, especially when a
+  cached `secUid` is used. Monitoring uses the known creator and ID to build
+  video, photo, or Story links instead of treating the `tiktokuser:` lookup
+  reference or a media URL as a post link. If the creator is unknown, it keeps
+  an absolute entry URL supplied by yt-dlp.
 - Saved-post deletion checks run frequently at first, then around 30 minutes,
   one hour, one day, and weekly.
 - `DOWNLOAD_LINK_TTL_MINUTES` controls new temporary links. Legacy
   `DOWNLOAD_LINK_TTL_HOURS` values are ignored.
+
+## Optional automatic TikTok LIVE recording
+
+The backend can automatically record TikTok LIVEs from accounts already on
+your watchlist. This feature is disabled by default and runs independently
+of normal post and Story monitoring.
+
+LIVE recording requires yt-dlp and FFmpeg/FFprobe, which are included in
+the project's Docker image. Configure TikTok cookies or a yt-dlp proxy
+using the existing settings if your account requires them.
+
+### Enable recording
+
+Copy the relevant settings from `.env.example` into your `.env`:
+
+```dotenv
+LIVE_RECORDING_ENABLED=true
+LIVE_RECORDING_HANDLES=example_creator
+DISCORD_LIVE_CHANNEL_ID=
+LIVE_POLL_SECONDS=120
+LIVE_MAX_CONCURRENT=2
+LIVE_PROBE_CONCURRENCY=2
+LIVE_PROBE_TIMEOUT_SECONDS=35
+LIVE_MIN_FREE_GB=10
+LIVE_MAX_HOURS=8
+```
+
+`LIVE_RECORDING_HANDLES` accepts a comma-separated list of TikTok usernames
+that are already on your watchlist. Leave it empty to check all watched
+TikTok accounts. The default polling interval is 120 seconds, with a
+minimum of 60 seconds.
+
+Set `DISCORD_LIVE_CHANNEL_ID` to send LIVE notifications to a dedicated
+Discord channel. If left empty, notifications use existing watch or
+subscription channels.
+
+After changing `.env`, recreate the bot container to apply the settings:
+
+```powershell
+docker compose up -d --build tiktok-discord-downloader
+```
+
+### Adaptive LIVE quality (optional)
+
+Adaptive quality is disabled by default. To enable it for the watched accounts
+whose LIVE recording is already enabled, add these settings to `.env`:
+
+```dotenv
+LIVE_ADAPTIVE_QUALITY_ENABLED=true
+LIVE_QUALITY_CHECK_MINUTES=15
+LIVE_QUALITY_SAMPLE_SECONDS=20
+```
+
+Recreate the bot container after changing these settings. The example Compose
+service forwards all three variables. The check interval has a minimum of
+5 minutes; the trial length is limited to 10-45 seconds. Setting
+`LIVE_ADAPTIVE_QUALITY_ENABLED=false` preserves the original single-file
+recording behavior.
+
+Recording starts immediately with a preferred LIVE format and a fallback.
+About 20 seconds after the first recorded data, the worker checks for other
+formats and then checks again every 15 minutes by default. It tests at most
+two alternatives per check while the original recording continues. A switch
+requires FFprobe to confirm an improvement in the recorded video and the
+candidate to keep growing for at least five seconds. Failed format IDs are
+skipped for an hour. Trials use extra bandwidth, disk space, and TikTok
+requests; checks are skipped when available disk space is too low.
+
+When a better stream is accepted, the old and new recordings are saved as
+separate, ordered archive parts. The Discord completion notification links to
+each part. The session journal supports recovery of interrupted parts on the
+next start; unarchived accepted parts stay available for retry. A switch may
+cause a short overlap or gap, so the total displayed duration can count an
+overlap twice. Parts with differing quality are not automatically stitched.
+The feature selects the best quality it can verify and access, without a
+guarantee that TikTok offers every possible rendition.
+
+### Webcast fallback and reconnects (optional)
+
+These settings apply only when automatic LIVE recording is enabled:
+
+~~~dotenv
+LIVE_WEBCAST_FALLBACK_ENABLED=true
+LIVE_RECONNECT_ENABLED=true
+LIVE_RECONNECT_DELAY_SECONDS=2
+LIVE_RECONNECT_MAX_ATTEMPTS=2
+LIVE_RECONNECT_STABLE_SECONDS=60
+~~~
+
+Both features are disabled by default. yt-dlp remains the primary LIVE
+detector and recorder. If it reports an account offline, the webcast fallback
+checks TikTok's public room data, verifies the requested creator and active
+room, and obtains a fresh HTTPS stream address. FFmpeg copies that stream
+into a recoverable Matroska recording. Signed stream addresses are kept in
+memory and excluded from journals and logs. If TikTok blocks the profile or
+returns incomplete room data, the fallback treats the result as inconclusive.
+
+After a recorder exits cleanly, reconnect checks the creator again after a
+short delay. It continues only while the same room is still LIVE. Two short
+reconnects are allowed by default; a segment lasting at least 60 seconds
+resets the short-reconnect count. Reaching the limit archives available parts
+as partial with the reason reconnect_limit. Network check failures also
+preserve available parts as partial. Reconnected footage is archived as
+separate parts, even when adaptive quality is off. Shutdown cancels pending
+reconnects and leaves interrupted bytes for startup recovery.
+
+### Recording and recovery
+
+A recording begins when yt-dlp detects an active LIVE. The bot sends a
+start notification after video data has been written. When recording
+finishes, it verifies the captured media, attempts a lossless remux and
+saves the result in the existing media archive. A completion notification
+contains a permanent archive link.
+
+Recordings are stored under
+`data/downloads/lives/<username>/<YYYY-MM-DD>/`.
+Recovery journals and temporary recording files are stored under
+`data/live/`. If the container stops during a recording, the next
+startup attempts to recover and archive the captured footage.
+
+`LIVE_MIN_FREE_GB` sets the free-space threshold checked before and during
+recording. `LIVE_MAX_HOURS` limits each recording session's length; an
+ongoing broadcast can be detected again on a subsequent poll.
+
+LIVE detection and capture use yt-dlp first.

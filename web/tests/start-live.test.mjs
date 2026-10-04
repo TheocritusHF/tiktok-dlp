@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { isBridgeRequestPath } from "../scripts/start-live-core.mjs";
+import { isBridgeRequestPath, proxyRequest } from "../scripts/start-live-core.mjs";
 
 const projectDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -28,6 +30,77 @@ test("start-live sends every archive and ordered-media route to the bridge", () 
   ]) {
     assert.equal(isBridgeRequestPath(pathname), false, pathname);
   }
+});
+
+test("gateway streams range bytes before the upstream body completes", { timeout: 5_000 }, async (context) => {
+  const upstreamReady = Promise.withResolvers();
+  const port = await startProxyFixture(context, (request, response) => {
+    assert.equal(request.headers.range, "bytes=2-7");
+    response.writeHead(206, {
+      "content-range": "bytes 2-7/10",
+      "content-length": "6",
+      "content-type": "video/mp4",
+      "cache-control": "private, max-age=604800",
+    });
+    response.write("234");
+    upstreamReady.resolve(response);
+  });
+  const client = http.get(`http://127.0.0.1:${port}/media/1`, {
+    headers: { range: "bytes=2-7" },
+  });
+  const [response] = await once(client, "response");
+  assert.equal(response.statusCode, 206);
+  assert.equal(response.headers["content-range"], "bytes 2-7/10");
+  assert.equal(response.headers["cache-control"], "private, max-age=604800");
+  const [firstChunk] = await once(response, "data");
+  assert.equal(firstChunk.toString(), "234");
+  const finished = once(response, "end");
+  (await upstreamReady.promise).end("567");
+  await finished;
+});
+
+for (const beforeHeaders of [false, true]) {
+  test(`gateway cancels abandoned media ${beforeHeaders ? "before headers" : "during streaming"}`, {
+    timeout: 5_000,
+  }, async (context) => {
+    const upstreamReady = Promise.withResolvers();
+    const upstreamClosed = Promise.withResolvers();
+    const port = await startProxyFixture(context, (_request, response) => {
+      response.once("close", () => upstreamClosed.resolve());
+      if (!beforeHeaders) {
+        response.writeHead(200, { "content-type": "video/mp4" });
+        response.write(Buffer.alloc(1024));
+      }
+      upstreamReady.resolve();
+    });
+    const client = http.get(`http://127.0.0.1:${port}/media/1`);
+    client.on("error", () => {});
+    const received = beforeHeaders ? null : once(client, "response");
+    await upstreamReady.promise;
+    if (received) {
+      const [response] = await received;
+      response.on("error", () => {});
+      await once(response, "data");
+    }
+    client.destroy();
+    await upstreamClosed.promise;
+  });
+}
+
+test("gateway closes the browser response when an upstream media stream breaks", {
+  timeout: 5_000,
+}, async (context) => {
+  const upstreamReady = Promise.withResolvers();
+  const port = await startProxyFixture(context, (_request, response) => {
+    response.writeHead(200, { "content-length": "100", "content-type": "video/mp4" });
+    response.write("first chunk");
+    upstreamReady.resolve(response);
+  });
+  const response = await fetch(`http://127.0.0.1:${port}/media/1`);
+  const body = response.arrayBuffer();
+  const rejected = assert.rejects(body);
+  (await upstreamReady.promise).destroy();
+  await rejected;
 });
 
 test("start-live fails when a child exits cleanly", async (context) => {
@@ -71,6 +144,27 @@ async function reservePorts(count) {
     server.close((error) => error ? reject(error) : resolve());
   })));
   return ports;
+}
+
+async function startProxyFixture(context, handler) {
+  const upstream = http.createServer(handler);
+  await listen(upstream);
+  const gateway = http.createServer((request, response) => {
+    proxyRequest(request, response, upstream.address().port);
+  });
+  await listen(gateway);
+  context.after(async () => {
+    await Promise.all([gateway, upstream].map((server) => new Promise((resolve) => {
+      server.close(resolve);
+      server.closeAllConnections();
+    })));
+  });
+  return gateway.address().port;
+}
+
+async function listen(server) {
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
 }
 
 function waitForExit(child) {

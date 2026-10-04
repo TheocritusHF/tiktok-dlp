@@ -3,9 +3,14 @@ import assert from 'node:assert/strict';
 import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { canonicalDownloadKey, createDownloadService } from '../src/download/service.js';
+import { canonicalDownloadKey, createDownloadService, resolveDownloadSource } from '../src/download/service.js';
 import { createPlatformRegistry, tiktokAdapter } from '../src/platforms/index.js';
 import { createStore } from '../src/state/store.js';
+
+const probeRegistry = createPlatformRegistry([{
+  ...tiktokAdapter,
+  capabilities: { ...tiktokAdapter.capabilities, probeBeforeDownload: true },
+}]);
 
 test('DownloadService dispatches TikTok probes and downloads through its platform adapter', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-adapter-download-service-'));
@@ -15,6 +20,7 @@ test('DownloadService dispatches TikTok probes and downloads through its platfor
   try {
     const registry = createPlatformRegistry([{
       ...tiktokAdapter,
+      capabilities: { ...tiktokAdapter.capabilities, probeBeforeDownload: true },
       async probe(sourceUrl, options) {
         calls.push({ operation: 'probe', sourceUrl, options });
         return {
@@ -71,13 +77,66 @@ test('DownloadService dispatches TikTok probes and downloads through its platfor
   }
 });
 
+for (const mediaType of ['video', 'slideshow']) {
+  test(`DownloadService saves canonical TikTok ${mediaType} metadata without a separate probe`, async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-single-pass-service-'));
+    const store = createStore(path.join(dir, 'state.db'));
+    const timestamp = 1767323045;
+    let downloads = 0;
+    try {
+      const service = createDownloadService({
+        config: { downloadDir: dir, publicBaseUrl: 'https://example.test' },
+        store,
+        metadataFetcher: async () => { throw new Error('Canonical downloads must not probe.'); },
+        downloader: async (sourceUrl, { metadata }) => {
+          downloads += 1;
+          assert.equal(metadata.id, '123');
+          assert.equal(metadata.webpage_url, sourceUrl);
+          assert.equal(metadata.title, undefined);
+          assert.equal(metadata.uploader, 'watched_creator');
+          const filePath = path.join(dir, mediaType === 'video' ? '123.mp4' : '123.zip');
+          await writeFile(filePath, 'media');
+          return {
+            filePath, videoId: '123', username: 'extracted_creator',
+            title: 'Extracted title', description: 'Extracted caption',
+            thumbnailUrl: 'https://cdn.example.test/cover.jpg',
+            duration: 12.5, timestamp, mediaType,
+          };
+        },
+      });
+      const result = await service.request('https://www.tiktok.com/@creator/video/123', {
+        username: 'watched_creator', type: 'monitor',
+      });
+      assert.equal(downloads, 1);
+      assert.equal(result.title, 'Extracted title');
+      assert.equal(result.description, 'Extracted caption');
+      assert.equal(result.thumbnailUrl, 'https://cdn.example.test/cover.jpg');
+      assert.equal(result.duration, 12.5);
+      assert.equal(result.timestamp, timestamp);
+      assert.equal(result.username, 'watched_creator');
+      assert.equal(result.mediaType, mediaType);
+      const post = store.getMediaPost('tiktok', '123');
+      assert.equal(post.title, result.title);
+      assert.equal(post.description, result.description);
+      assert.equal(post.creator_handle, 'watched_creator');
+      assert.equal(post.media_type, mediaType);
+      assert.equal(post.duration_seconds, 12.5);
+      assert.equal(post.published_at, timestamp * 1000);
+      assert.equal(store.getToken(result.token).expires_at, 0);
+    } finally {
+      store.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+}
+
 test('DownloadService coalesces concurrent requests into one immutable asset with separate deliveries', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-download-service-'));
   const store = createStore(path.join(dir, 'state.db'));
   const downloadDir = path.join(dir, 'downloads');
   let downloads = 0;
-  let releaseMetadata;
-  const metadataGate = new Promise((resolve) => { releaseMetadata = resolve; });
+  let releaseDownload;
+  const downloadGate = new Promise((resolve) => { releaseDownload = resolve; });
   try {
     const service = createDownloadService({
       config: {
@@ -90,17 +149,10 @@ test('DownloadService coalesces concurrent requests into one immutable asset wit
         maxQueuedDownloadsPerGuild: 4,
       },
       store,
-      metadataFetcher: async () => {
-        await metadataGate;
-        return {
-          id: '1234567890123456789',
-          uploader: 'creator',
-          title: 'Shared post',
-          webpage_url: 'https://www.tiktok.com/@creator/video/1234567890123456789',
-        };
-      },
+      metadataFetcher: async () => { throw new Error('Canonical downloads must not probe.'); },
       downloader: async () => {
         downloads += 1;
+        await downloadGate;
         const filePath = path.join(downloadDir, 'creator', 'shared.mp4');
         await mkdir(path.dirname(filePath), { recursive: true });
         await writeFile(filePath, 'video');
@@ -137,7 +189,7 @@ test('DownloadService coalesces concurrent requests into one immutable asset wit
         webpage_url: 'https://www.tiktok.com/@creator/video/1234567890123456789',
       },
     });
-    releaseMetadata();
+    releaseDownload();
     const [first, second, third] = await Promise.all([firstPromise, secondPromise, thirdPromise]);
 
     assert.equal(downloads, 1);
@@ -243,6 +295,258 @@ test('DownloadService applies per-user ingress limits before queuing more work',
   }
 });
 
+test('DownloadService reuses a canonical archive link without an upstream probe or queue slot', async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'download-cache-first-'));
+  const store = createStore(path.join(dir, 'state.db'));
+  let releaseProbe;
+  const probeGate = new Promise((resolve) => { releaseProbe = resolve; });
+  let probes = 0;
+  let downloads = 0;
+  let blocked;
+  let cachedRequest;
+  try {
+    const archived = await seedArchivedAsset(store, dir);
+    const service = createDownloadService({
+      config: { downloadDir: dir, publicBaseUrl: 'https://example.test', maxConcurrentDownloads: 1 },
+      store,
+      platformRegistry: probeRegistry,
+      metadataFetcher: async () => {
+        probes += 1;
+        await probeGate;
+        throw new Error('Upstream is unavailable.');
+      },
+      downloader: async () => { downloads += 1; },
+    });
+    blocked = service.request('https://www.tiktok.com/@creator/video/456').catch((error) => error);
+    await waitFor(() => probes === 1);
+
+    let result;
+    const cacheHitStartedAt = performance.now();
+    cachedRequest = service.request('https://m.tiktok.com/@Creator/video/123?utm_source=share', {
+      requestedBy: 'user-a',
+    }).then((value) => {
+      result = value;
+      t.diagnostic(`Cached delivery completed in ${(performance.now() - cacheHitStartedAt).toFixed(2)} ms while the upstream worker was blocked.`);
+    });
+    cachedRequest.catch(() => {});
+    await waitFor(() => result != null);
+    await cachedRequest;
+
+    assert.equal(result.reused, true);
+    assert.equal(result.fileId, archived.fileId);
+    assert.equal(result.filePath, archived.filePath);
+    assert.equal(result.sizeBytes, 5);
+    assert.equal(result.platform, 'tiktok');
+    assert.equal(result.videoId, '123');
+    assert.equal(result.username, 'creator');
+    assert.equal(result.title, 'Saved title');
+    assert.equal(result.description, 'Saved description');
+    assert.equal(result.mediaType, 'video');
+    assert.equal(result.duration, 12.5);
+    assert.equal(result.publishedAt, '2026-01-02T03:04:05.000Z');
+    assert.equal(result.assets[0].path, archived.filePath);
+    assert.equal(store.getToken(result.token).owner_id, 'user-a');
+    assert.equal(service.status().active, 1);
+    assert.equal(service.status().workQueued, 0);
+    assert.equal(probes, 1);
+    assert.equal(downloads, 0);
+  } finally {
+    releaseProbe();
+    await Promise.allSettled([blocked, cachedRequest]);
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+for (const unavailable of ['missing', 'trashed', 'other platform']) {
+  test(`DownloadService does not reuse ${unavailable} archive files`, async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'download-cache-miss-'));
+    const store = createStore(path.join(dir, 'state.db'));
+    let probes = 0;
+    let downloads = 0;
+    try {
+      const archived = await seedArchivedAsset(store, dir, {
+        platform: unavailable === 'other platform' ? 'x' : 'tiktok',
+      });
+      if (unavailable === 'missing') await rm(archived.filePath);
+      if (unavailable === 'trashed') store.trashFile(archived.fileId);
+      const service = createDownloadService({
+        config: { downloadDir: dir, publicBaseUrl: 'https://example.test' },
+        store,
+        metadataFetcher: async () => {
+          probes += 1;
+          return { id: '123', uploader: 'creator', title: 'Fresh title' };
+        },
+        downloader: async () => {
+          downloads += 1;
+          const filePath = path.join(dir, 'fresh.mp4');
+          await writeFile(filePath, 'fresh');
+          return { filePath, videoId: '123', mediaType: 'video', title: 'Fresh title' };
+        },
+      });
+      const result = await service.request('https://www.tiktok.com/@creator/video/123');
+      assert.equal(result.reused, false);
+      assert.equal(result.platform, 'tiktok');
+      assert.notEqual(result.fileId, archived.fileId);
+      assert.equal(result.title, 'Fresh title');
+      assert.equal(probes, 0);
+      assert.equal(downloads, 1);
+    } finally {
+      store.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+test('DownloadService still resolves short links before reusing the archive', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'download-cache-short-link-'));
+  const store = createStore(path.join(dir, 'state.db'));
+  let probes = 0;
+  try {
+    const archived = await seedArchivedAsset(store, dir);
+    const service = createDownloadService({
+      config: { downloadDir: dir, publicBaseUrl: 'https://example.test' },
+      store,
+      metadataFetcher: async () => { probes += 1; return { id: '123' }; },
+      downloader: async () => { throw new Error('Archived media must not download again.'); },
+    });
+    const result = await service.request('https://vm.tiktok.com/ZMshort/');
+    assert.equal(result.reused, true);
+    assert.equal(result.fileId, archived.fileId);
+    assert.equal(probes, 1);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+for (const mediaType of ['video', 'slideshow']) {
+  test(`DownloadService reuses legacy ${mediaType} sidecars without an upstream request`, async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'download-cache-sidecar-'));
+    const store = createStore(path.join(dir, 'state.db'));
+    try {
+      const filename = mediaType === 'video' ? '123.mp4' : '20260102T030405Z__creator__123.zip';
+      const filePath = path.join(dir, filename);
+      await writeFile(filePath, 'saved');
+      const imagePaths = mediaType === 'slideshow'
+        ? [1, 2].map(index => path.join(dir, `${path.parse(filename).name}__00${index}.jpg`))
+        : [];
+      for (const imagePath of imagePaths) await writeFile(imagePath, 'image');
+      const fileId = store.createFileRecord({
+        videoId: '123', username: 'creator', sourceUrl: '', filePath, filename, sizeBytes: 5,
+      });
+      await writeFile(path.join(dir, '123.info.json'), JSON.stringify({
+        id: '123', title: 'Archived title', description: 'Archived caption', duration: 12.5,
+        timestamp: 1767323045, thumbnail: 'https://example.test/poster.jpg',
+        imageCount: imagePaths.length,
+        formats: [{ url: 'https://expired.test/video.mp4' }],
+      }));
+      const service = createDownloadService({
+        config: { downloadDir: dir, publicBaseUrl: 'https://example.test' }, store,
+        metadataFetcher: async () => { throw new Error('Upstream is unavailable.'); },
+        downloader: async () => { throw new Error('Cached files must not download again.'); },
+      });
+      const result = await service.request(`https://www.tiktok.com/@creator/${mediaType === 'slideshow' ? 'photo' : 'video'}/123`);
+      assert.equal(result.fileId, fileId);
+      assert.equal(result.reused, true);
+      assert.equal(result.title, 'Archived title');
+      assert.equal(result.description, 'Archived caption');
+      assert.equal(result.duration, 12.5);
+      assert.equal(result.publishedAt, '2026-01-02T03:04:05.000Z');
+      assert.equal(result.thumbnailUrl, 'https://example.test/poster.jpg');
+      assert.equal(result.mediaType, mediaType);
+      assert.deepEqual(result.slideshowImagePaths, imagePaths);
+      assert.equal(result.formats, undefined);
+      assert.equal(store.getMediaPost('tiktok', '123'), null);
+      assert.equal(store.stats().fileCount, 1);
+    } finally {
+      store.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const [name, sidecar] of [
+  ['missing', null],
+  ['malformed', '{broken'],
+  ['for another post', JSON.stringify({ id: '456', title: 'Another post' })],
+  ['for another platform', JSON.stringify({ id: '123', platform: 'instagram', title: 'Another platform' })],
+  ['incomplete', JSON.stringify({ id: '123' })],
+  ['oversized', JSON.stringify({ id: '123', title: 'x'.repeat(1024 * 1024) })],
+]) {
+  test(`DownloadService probes when legacy metadata is ${name}`, async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'download-cache-legacy-'));
+    const store = createStore(path.join(dir, 'state.db'));
+    let probes = 0;
+    try {
+      const filePath = path.join(dir, 'legacy.zip');
+      const imagePaths = [path.join(dir, 'legacy__001.jpg'), path.join(dir, 'legacy__002.jpg')];
+      await writeFile(filePath, 'zip');
+      for (const imagePath of imagePaths) await writeFile(imagePath, 'image');
+      const fileId = store.createFileRecord({
+        videoId: '123', username: 'creator', sourceUrl: '', filePath,
+        filename: 'legacy.zip', sizeBytes: 3,
+      });
+      assert.equal(store.getMediaPost('tiktok', '123'), null);
+      if (sidecar !== null) await writeFile(path.join(dir, '123.info.json'), sidecar);
+      const service = createDownloadService({
+        config: { downloadDir: dir, publicBaseUrl: 'https://example.test' },
+        store,
+        metadataFetcher: async () => {
+          probes += 1;
+          return {
+            id: '123', uploader: 'creator', title: 'Legacy title',
+            description: 'Legacy description', duration: 12.5,
+            mediaType: 'slideshow', imageCount: 2,
+          };
+        },
+        downloader: async () => { throw new Error('Archived media must not download again.'); },
+      });
+      const result = await service.request('https://www.tiktok.com/@creator/photo/123');
+      assert.equal(probes, 1);
+      assert.equal(result.reused, true);
+      assert.equal(result.fileId, fileId);
+      assert.equal(result.title, 'Legacy title');
+      assert.equal(result.description, 'Legacy description');
+      assert.equal(result.duration, 12.5);
+      assert.equal(result.mediaType, 'slideshow');
+      assert.equal(result.imageCount, 2);
+      assert.deepEqual(result.slideshowImagePaths, imagePaths);
+    } finally {
+      store.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+test('DownloadService preserves archived slideshow images without fresh metadata', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'download-cache-slideshow-'));
+  const store = createStore(path.join(dir, 'state.db'));
+  try {
+    const imagePaths = [path.join(dir, 'saved__001.jpg'), path.join(dir, 'saved__002.jpg')];
+    for (const imagePath of imagePaths) await writeFile(imagePath, 'image');
+    const archived = await seedArchivedAsset(store, dir, {
+      mediaType: 'slideshow',
+      filename: 'saved.zip',
+      assets: imagePaths.map((imagePath, position) => ({ path: imagePath, kind: 'image', position, sizeBytes: 5 })),
+    });
+    const service = createDownloadService({
+      config: { downloadDir: dir, publicBaseUrl: 'https://example.test' },
+      store,
+      metadataFetcher: async () => { throw new Error('Upstream is unavailable.'); },
+    });
+    const result = await service.request('https://www.tiktok.com/@creator/photo/123');
+    assert.equal(result.fileId, archived.fileId);
+    assert.equal(result.mediaType, 'slideshow');
+    assert.equal(result.imageCount, 2);
+    assert.equal(result.assetCount, 2);
+    assert.deepEqual(result.slideshowImagePaths, imagePaths);
+  } finally {
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('DownloadService bounds metadata extraction with the shared worker concurrency', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-dlp-download-metadata-limit-'));
   const store = createStore(path.join(dir, 'state.db'));
@@ -263,6 +567,7 @@ test('DownloadService bounds metadata extraction with the shared worker concurre
         maxDownloadQueueSize: 10,
       },
       store,
+      platformRegistry: probeRegistry,
       metadataFetcher: async (sourceUrl) => {
         activeMetadata += 1;
         maxActiveMetadata = Math.max(maxActiveMetadata, activeMetadata);
@@ -335,6 +640,7 @@ test('DownloadService counts coalesced monitor requests against global admission
         maxDownloadQueueSize: 2,
       },
       store,
+      platformRegistry: probeRegistry,
       metadataFetcher: async () => {
         metadataCalls += 1;
         await metadataGate;
@@ -647,4 +953,29 @@ async function waitFor(predicate, timeoutMs = 2_000) {
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
   throw new Error('Timed out waiting for condition.');
+}
+
+async function seedArchivedAsset(store, dir, {
+  platform = 'tiktok',
+  mediaType = 'video',
+  filename = 'saved.mp4',
+  assets,
+} = {}) {
+  const filePath = path.join(dir, filename);
+  await writeFile(filePath, 'video');
+  const { fileId } = store.createFileWithMedia({
+    file: { platform, videoId: '123', username: 'creator', sourceUrl: '', filePath, filename, sizeBytes: 5 },
+    media: {
+      platform,
+      remoteId: '123',
+      creatorHandle: 'creator',
+      title: 'Saved title',
+      description: 'Saved description',
+      mediaType,
+      duration: 12.5,
+      publishedAt: '2026-01-02T03:04:05.000Z',
+      assets: assets ?? [{ path: filePath, kind: 'video', sizeBytes: 5 }],
+    },
+  });
+  return { fileId, filePath };
 }

@@ -394,6 +394,56 @@ test('runOnce burst scans when the normal profile window is full of new posts', 
   });
 });
 
+test('Instagram follow-up listings reuse only the profile resolved in the current poll', async () => {
+  const now = 1_700_000_200_000;
+  const store = new FakeStore([{
+    username: 'creator', platform: 'instagram', creator_id: 'stale-id',
+    channel_id: 'channel-1', created_at: 1_700_000_000_000,
+  }]);
+  const downloader = new FakeDownloader([]);
+  const highlights = [];
+  downloader.listHighlights = async (url, options) => {
+    highlights.push(options);
+    return { entries: [] };
+  };
+  let poll = 0;
+  downloader.listProfileVideos = async (url, options) => {
+    downloader.listCalls.push({ options });
+    if (!options.burst) poll += 1;
+    return {
+      metadata: { username: 'creator', creator_id: poll === 1 ? '123' : '789' },
+      entries: [{ id: `post-${poll}`, timestamp: 1_700_000_100 }],
+    };
+  };
+  const monitor = new TikTokMonitor({
+    store, downloader, now: () => now, scanLimit: 1, burstScanLimit: 2,
+    highlightHandles: ['creator'],
+  });
+  for (const creatorId of ['123', '789']) {
+    store.watches[0].next_check_at = null;
+    const summary = await monitor.runOnce({ waitForDownloads: true });
+    assert.equal(summary.failures, 0);
+    const expected = { platform: 'instagram', username: 'creator', creatorId };
+    assert.equal(downloader.listCalls.at(-2).options.resolvedProfile, undefined);
+    assert.deepEqual(downloader.listCalls.at(-1).options.resolvedProfile, expected);
+    assert.deepEqual(downloader.storyCalls.at(-1).options.resolvedProfile, expected);
+    assert.deepEqual(highlights.at(-1).resolvedProfile, expected);
+  }
+});
+
+test('empty Instagram polls can reuse fresh identity but never borrow a stored ID when metadata is absent', async () => {
+  for (const profileResult of [{ metadata: { creator_id: '123' }, entries: [] }, { entries: [] }, []]) {
+    const store = new FakeStore([{ username: 'creator', platform: 'instagram', creator_id: '456' }]);
+    store.recordWatchIdentity = () => ({ changed: false, username: 'creator', creatorId: '456' });
+    const downloader = new FakeDownloader(profileResult);
+    const monitor = new TikTokMonitor({ store, downloader, now: () => 1000 });
+    const summary = await monitor.runOnce({ waitForDownloads: true });
+    assert.equal(summary.failures, 0);
+    assert.equal(downloader.listCalls[0].options.resolvedProfile, undefined);
+    assert.equal(downloader.storyCalls[0].options.resolvedProfile.creatorId, profileResult.metadata ? '123' : '');
+  }
+});
+
 test('timestamp helpers compare videos against watch creation time', () => {
   assert.equal(resolveVideoTimestampMs({ timestamp: 1_700_000_000 }), 1_700_000_000_000);
   assert.equal(resolveVideoTimestampMs({ timestamp: 1_700_000_000_000 }), 1_700_000_000_000);
@@ -1207,4 +1257,85 @@ test('slow deletion checks run in a separate bounded worker and do not stall pro
   assert.equal(monitor.status().activeDeletionChecks, 1);
   releaseDeletion();
   await monitor.waitForIdle();
+});
+
+test('Instagram polls run at most every fifteen minutes while TikTok keeps its cadence', async () => {
+  let now = 1_700_000_200_000;
+  const store = new FakeStore([
+    { username: 'igcreator', platform: 'instagram' },
+    { username: 'ttcreator', platform: 'tiktok' },
+  ]);
+  const downloader = new FakeDownloader([]);
+  const monitor = new TikTokMonitor({ store, downloader, now: () => now, logger: null });
+  await monitor.runOnce();
+  assert.equal(store.watches[0].next_check_at, now + 15 * 60_000);
+  assert.equal(store.watches[1].next_check_at, now + 60_000);
+  now += 60_000;
+  await monitor.runOnce();
+  assert.equal(downloader.listCalls.filter(c => c.profileUrl.includes('instagram')).length, 1);
+  assert.equal(downloader.listCalls.filter(c => c.profileUrl.includes('tiktok')).length, 2);
+});
+
+test('Instagram watches serialize posts and stories while TikTok can proceed independently', async () => {
+  const store = new FakeStore([
+    { username: 'first', platform: 'instagram' },
+    { username: 'second', platform: 'instagram' },
+    { username: 'other', platform: 'tiktok' },
+  ]);
+  const events = [];
+  const downloader = new FakeDownloader([]);
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  downloader.listProfileVideos = async (url, { username }) => {
+    events.push(`posts:${username}`);
+    if (username === 'first') await gate;
+    return [];
+  };
+  downloader.listProfileStories = async (url, { username }) => {
+    events.push(`stories:${username}`);
+    return [];
+  };
+  const monitor = new TikTokMonitor({ store, downloader, logger: null });
+  const run = monitor.runOnce();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(events.includes('posts:first'));
+  assert.ok(events.includes('stories:other'));
+  assert.ok(!events.includes('posts:second'));
+  release();
+  await run;
+  assert.ok(events.indexOf('stories:first') < events.indexOf('posts:second'));
+});
+
+test('Instagram story restrictions fail the poll and respect the shared retry deadline', async () => {
+  const now = 1_700_000_200_000;
+  const store = new FakeStore([{ username: 'creator', platform: 'instagram' }]);
+  const downloader = new FakeDownloader([]);
+  downloader.listProfileStories = async () => {
+    throw Object.assign(new Error('Instagram is limiting requests'), { kind: 'rate_limited', retryAt: now + 24 * 60 * 60_000 });
+  };
+  const monitor = new TikTokMonitor({ store, downloader, now: () => now, logger: null });
+  const summary = await monitor.runOnce();
+  assert.equal(summary.failures, 1);
+  assert.equal(store.successes.length, 0);
+  assert.equal(store.watches[0].next_check_at, now + 24 * 60 * 60_000);
+});
+
+test('retryFailedVideo uses the recorded Instagram watch rather than a same-name TikTok watch', async () => {
+  const store = new FakeStore();
+  store.downloadFailures.set('story_123', {
+    video_id: 'story_123', platform: 'instagram', username: 'creator', status: 'dead_letter',
+    source_url: 'https://www.instagram.com/stories/creator/123/', media_type: 'story',
+  });
+  let selected;
+  store.getWatch = (username, platform) => {
+    selected = platform;
+    return { username, platform, channel_id: 'channel' };
+  };
+  const downloader = new FakeDownloader([]);
+  const monitor = new TikTokMonitor({ store, downloader, logger: { info() {}, warn() {} } });
+  const result = await monitor.retryFailedVideo('story_123');
+  assert.equal(result.completed, true);
+  assert.equal(selected, 'instagram');
+  assert.equal(downloader.downloadCalls[0].context.platform, 'instagram');
+  assert.equal(store.seenRecords[0].record.platform, 'instagram');
 });

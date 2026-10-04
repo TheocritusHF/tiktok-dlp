@@ -328,7 +328,8 @@ export function selectCacheEntriesForEviction(
       retainedBytes += size;
       continue;
     }
-    if (now - Number(entry.mtimeMs || 0) > maxAgeMs) {
+    const playbackCopy = /^playback-v\d+-[a-f0-9]{32}\.mp4$/.test(name);
+    if (!playbackCopy && now - Number(entry.mtimeMs || 0) > maxAgeMs) {
       candidates.push({ ...entry, name, size, expired: true });
     } else {
       retainedBytes += size;

@@ -57,6 +57,11 @@ export class Store {
         name: 'highlight-check-schedule',
         up: () => this.migrateHighlightCheckSchedule(),
       },
+      {
+        version: 7,
+        name: 'tiktok-quality-upgrade-schedule',
+        up: () => this.migrateQualityUpgradeSchedule(),
+      },
     ]);
     this.recoverInterruptedMonitorDownloadRetries();
   }
@@ -486,6 +491,22 @@ export class Store {
     `);
   }
 
+  migrateQualityUpgradeSchedule() {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS quality_upgrade_checks (
+        file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+        first_saved_at INTEGER NOT NULL,
+        stage INTEGER NOT NULL DEFAULT 0 CHECK(stage BETWEEN 0 AND 2),
+        next_check_at INTEGER,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_checked_at INTEGER,
+        last_error TEXT,
+        completed_at INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS idx_quality_upgrade_checks_due
+        ON quality_upgrade_checks(next_check_at, stage);
+    `);
+  }
 
   recoverInterruptedMonitorDownloadRetries(now = Date.now()) {
     return this.db.prepare(`
@@ -1075,16 +1096,9 @@ export class Store {
     if (!scope || typeof scope !== 'object') {
       this.db.exec('BEGIN IMMEDIATE');
       try {
-        if (scope && typeof scope === 'object' && scope.platform) {
-          this.db.prepare('DELETE FROM watch_subscriptions WHERE platform = ? AND username = ?').run(platform, normalizedUsername);
-          const result = this.db.prepare('DELETE FROM watched_users WHERE platform = ? AND username = ?').run(platform, normalizedUsername);
-          this.clearDeletionChecksForUsername(normalizedUsername, platform);
-          this.db.exec('COMMIT');
-          return result.changes > 0;
-        }
-        this.db.prepare('DELETE FROM watch_subscriptions WHERE username = ?').run(normalizedUsername);
-        const result = this.db.prepare('DELETE FROM watched_users WHERE username = ?').run(normalizedUsername);
-        this.clearDeletionChecksForUsername(normalizedUsername);
+        this.db.prepare('DELETE FROM watch_subscriptions WHERE platform = ? AND username = ?').run(platform, normalizedUsername);
+        const result = this.db.prepare('DELETE FROM watched_users WHERE platform = ? AND username = ?').run(platform, normalizedUsername);
+        this.clearDeletionChecksForUsername(normalizedUsername, platform);
         this.db.exec('COMMIT');
         return result.changes > 0;
       } catch (error) {
@@ -1094,14 +1108,13 @@ export class Store {
     }
 
     const guildId = String(scope.guildId ?? scope.guild_id ?? '');
-    const scopePlatform = normalizePlatform(scope.platform ?? platform);
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      const result = this.db.prepare('DELETE FROM watch_subscriptions WHERE platform = ? AND username = ? AND guild_id = ?').run(scopePlatform, normalizedUsername, guildId);
-      const remaining = this.db.prepare('SELECT 1 FROM watch_subscriptions WHERE platform = ? AND username = ? LIMIT 1').get(scopePlatform, normalizedUsername);
+      const result = this.db.prepare('DELETE FROM watch_subscriptions WHERE platform = ? AND username = ? AND guild_id = ?').run(platform, normalizedUsername, guildId);
+      const remaining = this.db.prepare('SELECT 1 FROM watch_subscriptions WHERE platform = ? AND username = ? LIMIT 1').get(platform, normalizedUsername);
       if (!remaining) {
-        this.db.prepare('DELETE FROM watched_users WHERE platform = ? AND username = ?').run(scopePlatform, normalizedUsername);
-        this.clearDeletionChecksForUsername(normalizedUsername, scopePlatform);
+        this.db.prepare('DELETE FROM watched_users WHERE platform = ? AND username = ?').run(platform, normalizedUsername);
+        this.clearDeletionChecksForUsername(normalizedUsername, platform);
       }
       this.db.exec('COMMIT');
       return result.changes > 0;
@@ -1114,96 +1127,23 @@ export class Store {
   getWatch(username, platform = 'tiktok') {
     const normalizedUsername = String(username ?? '').trim();
     if (!normalizedUsername) return null;
-    // Allow calling with object like { platform, username } or platform string
-    if (typeof platform === 'object' && platform !== null && platform.platform) {
-      const p = normalizePlatform(platform.platform);
-      try {
-        return this.db.prepare('SELECT * FROM watched_users WHERE platform = ? AND username = ?').get(p, normalizedUsername) ?? null;
-      } catch {
-        return this.db.prepare('SELECT * FROM watched_users WHERE username = ?').get(normalizedUsername) ?? null;
-      }
-    }
-    const normalizedPlatform = normalizePlatform(platform ?? 'tiktok');
-    try {
-      return this.db.prepare('SELECT * FROM watched_users WHERE platform = ? AND username = ?').get(normalizedPlatform, normalizedUsername) ?? null;
-    } catch {
-      return this.db.prepare('SELECT * FROM watched_users WHERE username = ?').get(normalizedUsername) ?? null;
-    }
+    const normalizedPlatform = normalizePlatform(platform?.platform ?? platform ?? 'tiktok');
+    return this.db.prepare('SELECT * FROM watched_users WHERE platform = ? AND username = ?').get(normalizedPlatform, normalizedUsername) ?? null;
   }
 
   listWatches(filter = null) {
-    if (filter && typeof filter === 'object' && filter.platform) {
-      const platform = normalizePlatform(filter.platform);
-      try {
-        return this.db.prepare(`
-          SELECT *
-          FROM watched_users
-          WHERE platform = ?
-          ORDER BY COALESCE(next_check_at, 0), username
-        `).all(platform);
-      } catch {
-        return this.db.prepare(`SELECT * FROM watched_users ORDER BY COALESCE(next_check_at, 0), username`).all().filter((r) => (r.platform ?? 'tiktok') === platform);
-      }
-    }
-    if (typeof filter === 'string' && filter) {
-      const platform = normalizePlatform(filter);
-      try {
-        return this.db.prepare(`
-          SELECT *
-          FROM watched_users
-          WHERE platform = ?
-          ORDER BY COALESCE(next_check_at, 0), username
-        `).all(platform);
-      } catch {
-        return this.db.prepare(`SELECT * FROM watched_users ORDER BY COALESCE(next_check_at, 0), username`).all().filter((r) => (r.platform ?? 'tiktok') === platform);
-      }
-    }
-    try {
-      return this.db.prepare(`
-        SELECT *
-        FROM watched_users
-        ORDER BY platform, COALESCE(next_check_at, 0), username
-      `).all();
-    } catch {
-      return this.db.prepare(`SELECT * FROM watched_users ORDER BY COALESCE(next_check_at, 0), username`).all();
-    }
+    const platform = typeof filter === 'string' ? filter : filter?.platform;
+    return this.db.prepare(`
+      SELECT *
+      FROM watched_users
+      ${platform ? 'WHERE platform = ?' : ''}
+      ORDER BY platform, COALESCE(next_check_at, 0), username
+    `).all(...(platform ? [normalizePlatform(platform)] : []));
   }
 
   listWatchesForScope({ guildId = '', channelId = '', platform = '' } = {}) {
     const normalizedPlatform = platform ? normalizePlatform(platform) : '';
-    if (normalizedPlatform) {
-      try {
-        return this.db.prepare(`
-          WITH ranked_subscriptions AS (
-            SELECT watch_subscriptions.*,
-              ROW_NUMBER() OVER (
-                PARTITION BY watch_subscriptions.platform, watch_subscriptions.username
-                ORDER BY CASE WHEN watch_subscriptions.guild_id = ? THEN 0 ELSE 1 END,
-                  watch_subscriptions.id
-              ) AS scope_rank
-            FROM watch_subscriptions
-            WHERE platform = ?
-              AND (
-                watch_subscriptions.guild_id = ?
-                OR (
-                  watch_subscriptions.guild_id = ''
-                  AND watch_subscriptions.channel_id = ?
-                )
-              )
-          )
-          SELECT watched_users.*, ranked_subscriptions.channel_id AS subscription_channel_id,
-            ranked_subscriptions.created_by AS subscription_created_by
-          FROM ranked_subscriptions
-          JOIN watched_users ON watched_users.platform = ranked_subscriptions.platform AND watched_users.username = ranked_subscriptions.username
-          WHERE ranked_subscriptions.scope_rank = 1
-          ORDER BY watched_users.username
-        `).all(String(guildId ?? ''), normalizedPlatform, String(guildId ?? ''), String(channelId ?? ''));
-      } catch {
-        return [];
-      }
-    }
-    try {
-      return this.db.prepare(`
+    return this.db.prepare(`
         WITH ranked_subscriptions AS (
           SELECT watch_subscriptions.*,
             ROW_NUMBER() OVER (
@@ -1212,11 +1152,12 @@ export class Store {
                 watch_subscriptions.id
             ) AS scope_rank
           FROM watch_subscriptions
-          WHERE watch_subscriptions.guild_id = ?
+          WHERE (watch_subscriptions.guild_id = ?
             OR (
               watch_subscriptions.guild_id = ''
               AND watch_subscriptions.channel_id = ?
-            )
+            ))
+            ${normalizedPlatform ? 'AND watch_subscriptions.platform = ?' : ''}
         )
         SELECT watched_users.*, ranked_subscriptions.channel_id AS subscription_channel_id,
           ranked_subscriptions.created_by AS subscription_created_by
@@ -1224,51 +1165,18 @@ export class Store {
         JOIN watched_users ON watched_users.platform = ranked_subscriptions.platform AND watched_users.username = ranked_subscriptions.username
         WHERE ranked_subscriptions.scope_rank = 1
         ORDER BY watched_users.platform, watched_users.username
-      `).all(String(guildId ?? ''), String(guildId ?? ''), String(channelId ?? ''));
-    } catch {
-      // Fallback for legacy DB without platform column
-      return this.db.prepare(`
-        WITH ranked_subscriptions AS (
-          SELECT watch_subscriptions.*,
-            ROW_NUMBER() OVER (
-              PARTITION BY watch_subscriptions.username
-              ORDER BY CASE WHEN watch_subscriptions.guild_id = ? THEN 0 ELSE 1 END,
-                watch_subscriptions.id
-            ) AS scope_rank
-          FROM watch_subscriptions
-          WHERE watch_subscriptions.guild_id = ?
-            OR (
-              watch_subscriptions.guild_id = ''
-              AND watch_subscriptions.channel_id = ?
-            )
-        )
-        SELECT watched_users.*, ranked_subscriptions.channel_id AS subscription_channel_id,
-          ranked_subscriptions.created_by AS subscription_created_by
-        FROM ranked_subscriptions
-        JOIN watched_users ON watched_users.username = ranked_subscriptions.username
-        WHERE ranked_subscriptions.scope_rank = 1
-        ORDER BY watched_users.username
-      `).all(String(guildId ?? ''), String(guildId ?? ''), String(channelId ?? ''));
-    }
+      `).all(String(guildId ?? ''), String(guildId ?? ''), String(channelId ?? ''), ...(normalizedPlatform ? [normalizedPlatform] : []));
   }
 
   getWatchSubscription(username, { guildId = '', platform = 'tiktok' } = {}) {
     const normalizedUsername = String(username ?? '').trim();
     const normalizedGuildId = String(guildId ?? '');
     const normalizedPlatform = normalizePlatform(platform ?? 'tiktok');
-    try {
-      return this.db.prepare(`
-        SELECT *
-        FROM watch_subscriptions
-        WHERE platform = ? AND username = ? AND guild_id = ?
-      `).get(normalizedPlatform, normalizedUsername, normalizedGuildId) ?? null;
-    } catch {
-      return this.db.prepare(`
-        SELECT *
-        FROM watch_subscriptions
-        WHERE username = ? AND guild_id = ?
-      `).get(normalizedUsername, normalizedGuildId) ?? null;
-    }
+    return this.db.prepare(`
+      SELECT *
+      FROM watch_subscriptions
+      WHERE platform = ? AND username = ? AND guild_id = ?
+    `).get(normalizedPlatform, normalizedUsername, normalizedGuildId) ?? null;
   }
 
   hasWatchSubscription(username, scope = {}) {
@@ -1278,39 +1186,13 @@ export class Store {
 
   listWatchSubscriptions(username, platform = null) {
     const normalizedUsername = String(username ?? '').trim();
-    if (platform) {
-      const normalizedPlatform = normalizePlatform(platform);
-      try {
-        return this.db.prepare(`
-          SELECT *
-          FROM watch_subscriptions
-          WHERE platform = ? AND username = ?
-          ORDER BY guild_id, created_at, id
-        `).all(normalizedPlatform, normalizedUsername);
-      } catch {
-        return this.db.prepare(`
-          SELECT *
-          FROM watch_subscriptions
-          WHERE username = ?
-          ORDER BY guild_id, created_at, id
-        `).all(normalizedUsername).filter((r) => (r.platform ?? 'tiktok') === normalizedPlatform);
-      }
-    }
-    try {
-      return this.db.prepare(`
-        SELECT *
-        FROM watch_subscriptions
-        WHERE username = ?
-        ORDER BY platform, guild_id, created_at, id
-      `).all(normalizedUsername);
-    } catch {
-      return this.db.prepare(`
-        SELECT *
-        FROM watch_subscriptions
-        WHERE username = ?
-        ORDER BY guild_id, created_at, id
-      `).all(normalizedUsername);
-    }
+    return this.db.prepare(`
+      SELECT *
+      FROM watch_subscriptions
+      WHERE username = ?
+        ${platform ? 'AND platform = ?' : ''}
+      ORDER BY platform, guild_id, created_at, id
+    `).all(normalizedUsername, ...(platform ? [normalizePlatform(platform)] : []));
   }
 
   getAlertDelivery({ videoId, subscriptionId, eventType = 'new_post' } = {}) {
@@ -1387,6 +1269,7 @@ export class Store {
 
   recordMonitorDownloadFailure({
     videoId,
+    platform = '',
     username = '',
     sourceUrl = '',
     title = '',
@@ -1413,12 +1296,13 @@ export class Store {
         : null;
       this.db.prepare(`
         INSERT INTO monitor_download_failures (
-          video_id, username, source_url, title, media_type, status,
+          video_id, platform, username, source_url, title, media_type, status,
           failure_count, retry_count, first_failed_at, last_failed_at,
           last_error, dead_lettered_at, last_retry_at, resolved_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
         ON CONFLICT(video_id) DO UPDATE SET
+          platform = excluded.platform,
           username = excluded.username,
           source_url = excluded.source_url,
           title = excluded.title,
@@ -1432,6 +1316,7 @@ export class Store {
           updated_at = excluded.updated_at
       `).run(
         id,
+        normalizePlatform(platform || existing?.platform || 'tiktok'),
         String(username || existing?.username || ''),
         String(sourceUrl || existing?.source_url || ''),
         String(title || existing?.title || ''),
@@ -1815,82 +1700,45 @@ export class Store {
     `).all(Math.max(1, Math.min(100, Number(limit) || 25)));
   }
 
-  markWatchSuccess(username, now = Date.now(), nextCheckAt = null) {
+  markWatchSuccess(username, now = Date.now(), nextCheckAt = null, platform = 'tiktok') {
     const normalizedUsername = String(username ?? '').trim();
-    try {
-      const watch = this.db.prepare('SELECT platform FROM watched_users WHERE username = ? LIMIT 1').get(normalizedUsername);
-      if (watch?.platform) {
-        this.db.prepare(`
-          UPDATE watched_users
-          SET last_checked_at = ?, last_success_at = ?, failure_count = 0, last_error = NULL, next_check_at = ?
-          WHERE platform = ? AND username = ?
-        `).run(now, now, nextCheckAt, watch.platform, normalizedUsername);
-        return;
-      }
-    } catch {}
-
+    const normalizedPlatform = normalizePlatform(platform);
     this.db.prepare(`
       UPDATE watched_users
       SET last_checked_at = ?, last_success_at = ?, failure_count = 0, last_error = NULL, next_check_at = ?
-      WHERE username = ?
-    `).run(now, now, nextCheckAt, username);
+      WHERE platform = ? AND username = ?
+    `).run(now, now, nextCheckAt, normalizedPlatform, normalizedUsername);
   }
 
-  markWatchFailure(username, error, nextCheckAt, now = Date.now()) {
+  markWatchFailure(username, error, nextCheckAt, now = Date.now(), platform = 'tiktok') {
     const normalizedUsername = String(username ?? '').trim();
-    try {
-      const watch = this.db.prepare('SELECT platform FROM watched_users WHERE username = ? LIMIT 1').get(normalizedUsername);
-      if (watch?.platform) {
-        this.db.prepare(`
-          UPDATE watched_users
-          SET last_checked_at = ?, failure_count = failure_count + 1, last_error = ?, next_check_at = ?
-          WHERE platform = ? AND username = ?
-        `).run(now, String(error).slice(0, 500), nextCheckAt, watch.platform, normalizedUsername);
-        return;
-      }
-    } catch {}
-
+    const normalizedPlatform = normalizePlatform(platform);
     this.db.prepare(`
       UPDATE watched_users
       SET last_checked_at = ?, failure_count = failure_count + 1, last_error = ?, next_check_at = ?
-      WHERE username = ?
-    `).run(now, String(error).slice(0, 500), nextCheckAt, username);
+      WHERE platform = ? AND username = ?
+    `).run(now, String(error).slice(0, 500), nextCheckAt, normalizedPlatform, normalizedUsername);
   }
+
   markHighlightCheckSuccess(username, platform = 'instagram', now = Date.now(), nextCheckAt = null) {
     const normalizedUsername = String(username ?? '').trim();
     const normalizedPlatform = normalizePlatform(platform ?? 'instagram');
-    try {
-      this.db.prepare(`
-        UPDATE watched_users
-        SET last_highlight_check_at = ?, highlight_failure_count = 0, highlight_last_error = NULL, next_highlight_check_at = ?
-        WHERE platform = ? AND username = ?
-      `).run(now, nextCheckAt, normalizedPlatform, normalizedUsername);
-    } catch {
-      this.db.prepare(`
-        UPDATE watched_users
-        SET last_highlight_check_at = ?, highlight_failure_count = 0, highlight_last_error = NULL, next_highlight_check_at = ?
-        WHERE username = ?
-      `).run(now, nextCheckAt, normalizedUsername);
-    }
+    this.db.prepare(`
+      UPDATE watched_users
+      SET last_highlight_check_at = ?, highlight_failure_count = 0, highlight_last_error = NULL, next_highlight_check_at = ?
+      WHERE platform = ? AND username = ?
+    `).run(now, nextCheckAt, normalizedPlatform, normalizedUsername);
   }
 
   markHighlightCheckFailure(username, platform = 'instagram', error = '', nextCheckAt = null, now = Date.now()) {
     const normalizedUsername = String(username ?? '').trim();
     const normalizedPlatform = normalizePlatform(platform ?? 'instagram');
     const lastError = String(error?.message ?? error ?? '').slice(0, 500);
-    try {
-      this.db.prepare(`
-        UPDATE watched_users
-        SET last_highlight_check_at = ?, highlight_failure_count = highlight_failure_count + 1, highlight_last_error = ?, next_highlight_check_at = ?
-        WHERE platform = ? AND username = ?
-      `).run(now, lastError, nextCheckAt, normalizedPlatform, normalizedUsername);
-    } catch {
-      this.db.prepare(`
-        UPDATE watched_users
-        SET last_highlight_check_at = ?, highlight_failure_count = highlight_failure_count + 1, highlight_last_error = ?, next_highlight_check_at = ?
-        WHERE username = ?
-      `).run(now, lastError, nextCheckAt, normalizedUsername);
-    }
+    this.db.prepare(`
+      UPDATE watched_users
+      SET last_highlight_check_at = ?, highlight_failure_count = highlight_failure_count + 1, highlight_last_error = ?, next_highlight_check_at = ?
+      WHERE platform = ? AND username = ?
+    `).run(now, lastError, nextCheckAt, normalizedPlatform, normalizedUsername);
   }
 
 
@@ -4497,6 +4345,149 @@ export class Store {
     if (!ids.length) return 0;
     const placeholders = ids.map(() => '?').join(', ');
     return this.db.prepare(`DELETE FROM jobs WHERE id IN (${placeholders})`).run(...ids).changes;
+  }
+
+  /** Enroll one monitored TikTok video. Unique file_id prevents duplicate checks. */
+  scheduleQualityUpgrade(fileId, now = Date.now()) {
+    const file = this.db.prepare(`
+      SELECT files.*, COALESCE(media_posts.media_type, '') AS media_type
+      FROM files LEFT JOIN media_posts
+        ON media_posts.platform = files.platform AND media_posts.remote_id = files.video_id
+      WHERE files.id = ?
+    `).get(fileId);
+    if (!file || file.platform !== 'tiktok' || file.retention_status !== 'active'
+      || !/\/video\/\d+/.test(file.source_url ?? '')
+      || !/\.mp4$/i.test(file.path ?? '')
+      || /story|slide|photo/i.test(file.media_type ?? '')
+      || now - Number(file.created_at) >= 72 * 60 * 60_000) return false;
+    const age = now - Number(file.created_at);
+    const stage = age >= 24 * 60 * 60_000 ? 1 : 0;
+    const due = age >= (stage === 0 ? 6 : 24) * 60 * 60_000
+      ? now : Number(file.created_at) + (stage === 0 ? 6 : 24) * 60 * 60_000;
+    return this.db.prepare(`
+      INSERT OR IGNORE INTO quality_upgrade_checks (file_id, first_saved_at, stage, next_check_at)
+      VALUES (?, ?, ?, ?)
+    `).run(file.id, file.created_at, stage, due).changes > 0;
+  }
+
+  isQualityUpgradePathExclusive(fileId) {
+    const file = this.db.prepare('SELECT path FROM files WHERE id = ?').get(fileId);
+    if (!file) return false;
+    return this.db.prepare(`
+      SELECT COUNT(*) AS count FROM files
+      WHERE path = ? AND id <> ? AND retention_status = 'active'
+    `).get(file.path, fileId).count === 0;
+  }
+
+  /** Catch up on monitored posts saved in the last 72 hours after an upgrade/restart. */
+  backfillRecentQualityUpgrades(now = Date.now()) {
+    const recent = this.db.prepare(`
+      SELECT DISTINCT files.id
+      FROM files JOIN jobs ON jobs.file_id = files.id AND jobs.type = 'monitor'
+      WHERE files.platform = 'tiktok' AND files.retention_status = 'active'
+        AND files.created_at BETWEEN ? AND ?
+        AND files.source_url LIKE '%/video/%' AND lower(files.path) LIKE '%.mp4'
+      ORDER BY files.created_at DESC LIMIT 200
+    `).all(now - 72 * 60 * 60_000, now);
+    return recent.reduce((count, row) => count + Number(this.scheduleQualityUpgrade(row.id, now)), 0);
+  }
+
+  listQualityUpgradeRecords(limit = 500) {
+    return this.db.prepare(`
+      SELECT q.*, f.id AS file_id, f.video_id, f.platform, f.source_url,
+        f.path, f.size_bytes, f.retention_status,
+        COALESCE(m.media_type, '') AS media_type
+      FROM quality_upgrade_checks q
+      JOIN files f ON f.id = q.file_id
+      LEFT JOIN media_posts m ON m.platform = f.platform AND m.remote_id = f.video_id
+      ORDER BY q.first_saved_at DESC LIMIT ?
+    `).all(Math.min(2000, Math.max(1, Number(limit) || 500)));
+  }
+
+  listDueQualityUpgrades(now = Date.now(), limit = 2) {
+    return this.db.prepare(`
+      SELECT q.*, f.video_id, f.platform, f.source_url, f.username, f.path,
+        f.size_bytes, f.retention_status,
+        COALESCE(m.media_type, '') AS media_type
+      FROM quality_upgrade_checks q
+      JOIN files f ON f.id = q.file_id
+      LEFT JOIN media_posts m ON m.platform = f.platform AND m.remote_id = f.video_id
+      WHERE q.completed_at IS NULL AND q.next_check_at <= ?
+        AND f.retention_status = 'active'
+      ORDER BY q.next_check_at ASC LIMIT ?
+    `).all(now, Math.min(10, Math.max(1, Number(limit) || 2)));
+  }
+
+  #advanceQualityUpgradeStage(fileId, stage, now, error = null) {
+    const row = this.db.prepare(`
+      SELECT first_saved_at FROM quality_upgrade_checks
+      WHERE file_id = ? AND stage = ? AND completed_at IS NULL
+    `).get(fileId, stage);
+    if (!row) throw new Error('The quality-check stage changed before its result was recorded.');
+    // Skip elapsed stages if Docker was shut down during a scheduled check.
+    let nextStage = stage + 1;
+    while (nextStage < 3 && Number(row.first_saved_at) + [6, 24, 72][nextStage] * 60 * 60_000 <= now) {
+      nextStage += 1;
+    }
+    const completed = nextStage >= 3;
+    const nextDue = completed ? null : Number(row.first_saved_at) + [6, 24, 72][nextStage] * 60 * 60_000;
+    this.db.prepare(`
+      UPDATE quality_upgrade_checks SET stage = ?, next_check_at = ?, attempts = 0,
+        last_checked_at = ?, last_error = ?, completed_at = ? WHERE file_id = ?
+    `).run(completed ? stage : nextStage, nextDue, now, error, completed ? now : null, fileId);
+  }
+
+  completeQualityCheck(fileId, stage, now = Date.now()) {
+    this.#advanceQualityUpgradeStage(fileId, stage, now);
+  }
+
+  finishQualityUpgrade(fileId, reason = '', now = Date.now()) {
+    this.db.prepare(`UPDATE quality_upgrade_checks
+      SET next_check_at = NULL, completed_at = ?, last_checked_at = ?, last_error = ?
+      WHERE file_id = ? AND completed_at IS NULL
+    `).run(now, now, reason || null, fileId);
+  }
+
+  failQualityCheck(fileId, stage, error, now = Date.now(), retryDelayMs = 60 * 60_000, maxAttempts = 2) {
+    const row = this.db.prepare(`
+      SELECT attempts FROM quality_upgrade_checks
+      WHERE file_id = ? AND stage = ? AND completed_at IS NULL
+    `).get(fileId, stage);
+    if (!row) return;
+    const attempts = Number(row.attempts) + 1;
+    if (attempts >= maxAttempts) {
+      this.#advanceQualityUpgradeStage(fileId, stage, now, String(error).slice(0, 500));
+    } else {
+      this.db.prepare(`UPDATE quality_upgrade_checks SET attempts = ?, next_check_at = ?,
+        last_checked_at = ?, last_error = ? WHERE file_id = ? AND stage = ?
+      `).run(attempts, now + retryDelayMs, now, String(error).slice(0, 500), fileId, stage);
+    }
+  }
+
+  /** The file path and file ID never change; linked Discord URLs remain valid. */
+  commitQualityUpgrade(fileId, stage, { sizeBytes, width, height }, now = Date.now()) {
+    const positive = [sizeBytes, width, height].every((n) => Number.isSafeInteger(n) && n > 0);
+    if (!positive) throw new Error('Verified replacement size and dimensions must be positive integers.');
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const file = this.db.prepare(`SELECT path FROM files
+        WHERE id = ? AND platform = 'tiktok' AND retention_status = 'active'
+      `).get(fileId);
+      if (!file) throw new Error('Archived file is not active; refusing the quality upgrade.');
+      const valid = this.db.prepare(`SELECT 1 FROM quality_upgrade_checks
+        WHERE file_id = ? AND stage = ? AND completed_at IS NULL
+      `).get(fileId, stage);
+      if (!valid) throw new Error('Quality check has already completed or changed stage.');
+      this.db.prepare('UPDATE files SET size_bytes = ? WHERE id = ?').run(sizeBytes, fileId);
+      this.db.prepare(`UPDATE media_assets
+        SET size_bytes = ?, width = ?, height = ? WHERE file_id = ? AND path = ?
+      `).run(sizeBytes, width, height, fileId, file.path);
+      this.#advanceQualityUpgradeStage(fileId, stage, now);
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   stats() {

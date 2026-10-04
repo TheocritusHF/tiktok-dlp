@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 
 const DEFAULT_TIMEOUT_MS = 30000;
 const MAX_STDOUT_BYTES = 2 * 1024 * 1024;
+const FAILURE_STAGES = new Set(['login', 'lookup', 'posts', 'stories', 'highlights']);
 
 function galleryDlError(kind, message, details = {}) {
   return Object.assign(new Error(message), {
@@ -11,6 +12,7 @@ function galleryDlError(kind, message, details = {}) {
     retryable: Boolean(details.retryable),
     code: details.code ?? null,
     signal: details.signal ?? null,
+    stage: FAILURE_STAGES.has(details.stage) ? details.stage : '',
     stderr: String(details.stderr ?? ''),
     ...(details.cause ? { cause: details.cause } : {}),
   });
@@ -20,7 +22,8 @@ function classifyPrivateFailure(message, details = {}) {
   const text = String(message ?? '').toLowerCase();
   let kind = 'private_error';
   let retryable = false;
-  if (/429|too many requests|rate.?limit|throttled/.test(text)) {
+  if (/429|too many requests|rate.?limit|throttled/.test(text)
+    || (text.includes('feedback_required') && text.includes('we limit how often'))) {
     kind = 'rate_limited';
     retryable = true;
   } else if (/not found|does not exist|404|user not found/.test(text)) {
@@ -51,6 +54,9 @@ async function runPrivateList(handle, type, options = {}) {
   const cookiesFile = String(options.instagramCookiesFile ?? options.config?.instagramCookiesFile ?? '').trim()
     || String(process.env.INSTAGRAM_COOKIES_FILE ?? '').trim()
     || '/app/cookies/instagram.txt';
+  const deviceFile = String(options.instagramDeviceFile ?? options.config?.instagramDeviceFile ?? '').trim()
+    || String(process.env.INSTAGRAM_DEVICE_FILE ?? '').trim()
+    || '/app/data/instagram-device.json';
   const timeoutMs = Number(options.galleryDlTimeoutMs ?? options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   const spawnImpl = options.spawnImpl ?? defaultSpawn;
   const scriptPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../scripts/instagram-private-list.py');
@@ -60,7 +66,14 @@ async function runPrivateList(handle, type, options = {}) {
     '--type', type,
     '--limit', String(limit),
     '--cookies', cookiesFile,
+    '--device-file', deviceFile,
   ];
+  const profile = options.resolvedProfile;
+  if (profile?.platform === 'instagram'
+    && String(profile.username ?? '').toLowerCase() === String(handle).toLowerCase()
+    && typeof profile.creatorId === 'string' && /^[1-9][0-9]*$/.test(profile.creatorId)) {
+    args.push('--user-id', profile.creatorId);
+  }
 
   const stdout = await runPython(args, { spawnImpl, timeoutMs, signal: options.signal ?? null });
   let parsed;
@@ -70,7 +83,7 @@ async function runPrivateList(handle, type, options = {}) {
     throw galleryDlError('invalid_output', 'Instagram private API returned invalid JSON.', { retryable: false, cause });
   }
   if (parsed && typeof parsed.error === 'string') {
-    throw classifyPrivateFailure(parsed.error, { kind: parsed.kind });
+    throw classifyPrivateFailure(parsed.error, { stage: parsed.stage });
   }
   if (!parsed || !Array.isArray(parsed.entries)) {
     throw galleryDlError('invalid_output', 'Instagram private API returned unexpected shape.');
@@ -155,7 +168,7 @@ async function runPython(args, { spawnImpl, timeoutMs, signal }) {
         try {
           const maybe = JSON.parse(stdout);
           if (maybe && typeof maybe.error === 'string') {
-            finish(classifyPrivateFailure(maybe.error, { kind: maybe.kind, code, signal: sig, stderr }));
+            finish(classifyPrivateFailure(maybe.error, { stage: maybe.stage, code, signal: sig, stderr }));
             return;
           }
         } catch {}
