@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { JSON_REQUEST_TIMEOUT_MS } from "../lib/json-request.mjs";
 import {
   MAX_VIDEO_PAGE_SIZE,
   bookmarkedVideoPageParams,
@@ -301,6 +302,75 @@ test("transient bookmark failures use bounded retries and terminal failures roll
   assert.equal(controller.getSnapshot().confirmedIds.has("9"), true);
   assert.equal(controller.getSnapshot().error, "");
   controller.dispose();
+});
+
+for (const phase of ["headers", "body", "migration"]) {
+  test(`bookmark hydration ${phase} timeout preserves cached IDs and permits manual recovery without automatic retries`, async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const storage = memoryStorage({
+      [BOOKMARK_STORAGE_KEY]: JSON.stringify(["cached"]),
+      ...(phase !== "migration" ? { [BOOKMARK_MIGRATION_STORAGE_KEY]: "1" } : {}),
+    });
+    let calls = 0;
+    let recover = false;
+    let signal;
+    const stalled = deferred();
+    const controller = new BookmarkController({
+      base: "https://archive.test",
+      sleepImpl: () => assert.fail("Timeouts must not multiply into automatic retries"),
+      fetchImpl: async (_url, init) => {
+        calls++;
+        signal = init.signal;
+        if (recover) return jsonResponse({ fileIds: ["cached", "server"] });
+        if (phase === "migration") assert.equal(init.method, "POST");
+        return phase === "body" ? { ok: true, json: () => stalled.promise } : stalled.promise;
+      },
+    });
+    const hydration = controller.hydrate(storage);
+    await Promise.resolve();
+    t.mock.timers.tick(JSON_REQUEST_TIMEOUT_MS);
+    await hydration;
+    assert.equal(calls, 1);
+    assert.equal(signal.aborted, true);
+    assert.equal(controller.getSnapshot().syncing, false);
+    assert.equal(controller.getSnapshot().ready, false);
+    assert.match(controller.getSnapshot().error, /timed out/);
+    assert.deepEqual([...controller.getSnapshot().visibleIds], ["cached"]);
+    if (phase === "migration") assert.notEqual(storage.getItem(BOOKMARK_MIGRATION_STORAGE_KEY), "1");
+
+    recover = true;
+    await controller.refresh();
+    assert.equal(calls, 3); // Rehydrate, then perform the requested authoritative refresh.
+    assert.equal(controller.getSnapshot().ready, true);
+    assert.equal(controller.getSnapshot().error, "");
+    assert.deepEqual([...controller.getSnapshot().confirmedIds].sort(), ["cached", "server"]);
+    controller.dispose();
+  });
+}
+
+test("a timed-out bookmark refresh retains confirmed IDs and disposal cancels without an error", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let calls = 0;
+  const stalled = deferred();
+  const controller = new BookmarkController({
+    base: "https://archive.test",
+    fetchImpl: async () => ++calls === 1 ? jsonResponse({ fileIds: ["confirmed"] }) : stalled.promise,
+    sleepImpl: () => assert.fail("Timeouts must not retry automatically"),
+  });
+  await controller.hydrate(memoryStorage({ [BOOKMARK_MIGRATION_STORAGE_KEY]: "1" }));
+  const refresh = controller.refresh();
+  t.mock.timers.tick(JSON_REQUEST_TIMEOUT_MS);
+  await refresh;
+  assert.deepEqual([...controller.getSnapshot().confirmedIds], ["confirmed"]);
+  assert.deepEqual([...controller.getSnapshot().visibleIds], ["confirmed"]);
+  assert.equal(controller.getSnapshot().syncing, false);
+  assert.match(controller.getSnapshot().error, /timed out/);
+  const canceledRefresh = controller.refresh();
+  controller.dispose();
+  await canceledRefresh;
+  assert.equal(controller.getSnapshot().error, "");
+  t.mock.timers.tick(JSON_REQUEST_TIMEOUT_MS);
+  assert.equal(calls, 3);
 });
 
 test("revalidation cannot overwrite an ID that was pending when it started", () => {

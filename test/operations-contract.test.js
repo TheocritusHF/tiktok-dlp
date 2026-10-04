@@ -39,7 +39,9 @@ test('production deploy targets the tested commit and backs up before recreation
   const recreateOffset = deployScript.indexOf('compose up -d --no-build --force-recreate');
   assert.ok(backupOffset > 0 && recreateOffset > backupOffset);
 
-  assert.match(deployWorkflow, /github\.event\.workflow_run\.head_sha/);
+  assert.match(deployWorkflow, /workflow_dispatch:/);
+  assert.doesNotMatch(deployWorkflow, /^\s+workflow_run:/m);
+  assert.match(deployWorkflow, /inputs\.deploy_sha/);
   assert.match(deployWorkflow, /git show "\$target":scripts\/deploy-prod\.sh/);
   assert.match(deployWorkflow, /DEPLOY_SHA="\$target" bash "\$tmp"/);
 });

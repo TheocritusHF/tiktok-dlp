@@ -28,6 +28,7 @@ export function useArchivePosts({
   const [pendingLifecycleIds, setPendingLifecycleIds] = useState<Set<string>>(() => new Set());
   const [revision, setRevision] = useState(0);
   const generationRef = useRef(0);
+  const pageControllerRef = useRef<AbortController | null>(null);
   const loadingMoreRef = useRef(false);
   const bookmarkMutationsRef = useRef(new Set<string>());
   const lifecycleMutationsRef = useRef(new Set<string>());
@@ -58,6 +59,8 @@ export function useArchivePosts({
   useEffect(() => {
     if (!configuredBase) return;
     const controller = new AbortController();
+    pageControllerRef.current?.abort();
+    pageControllerRef.current = controller;
     const generation = generationRef.current + 1;
     generationRef.current = generation;
     loadingMoreRef.current = false;
@@ -79,18 +82,23 @@ export function useArchivePosts({
         setSource("error");
         setError(nextError instanceof Error ? nextError.message : String(nextError));
       });
-    return () => controller.abort();
+    return () => {
+      controller.abort();
+      pageControllerRef.current?.abort();
+    };
   }, [configuredBase, fetchPage, revision]);
 
   const loadMore = useCallback(async () => {
     if (!configuredBase || !nextCursor || loadingMoreRef.current) return;
     const generation = generationRef.current;
+    const controller = new AbortController();
+    pageControllerRef.current = controller;
     loadingMoreRef.current = true;
     setLoadingMore(true);
     setError("");
     try {
-      const page = await fetchPage(nextCursor);
-      if (generation !== generationRef.current) return;
+      const page = await fetchPage(nextCursor, controller.signal);
+      if (controller.signal.aborted || generation !== generationRef.current) return;
       setPosts((current) => {
         const byId = new Map(current.map((post) => [post.id, post]));
         for (const post of page.items) byId.set(post.id, post);
@@ -98,11 +106,13 @@ export function useArchivePosts({
       });
       setNextCursor(page.nextCursor);
     } catch (nextError) {
-      if (generation !== generationRef.current) return;
+      if (controller.signal.aborted || generation !== generationRef.current) return;
       setError(nextError instanceof Error ? nextError.message : String(nextError));
     } finally {
-      loadingMoreRef.current = false;
-      setLoadingMore(false);
+      if (generation === generationRef.current) {
+        loadingMoreRef.current = false;
+        setLoadingMore(false);
+      }
     }
   }, [configuredBase, fetchPage, nextCursor]);
 

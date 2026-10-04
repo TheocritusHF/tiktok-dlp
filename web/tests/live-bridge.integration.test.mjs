@@ -1,13 +1,16 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import http from "node:http";
 import { createServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import test from "node:test";
+import { promisify } from "node:util";
+
+const runFile = promisify(execFile);
 
 test("live bridge paginates active videos and serves an existing .image sidecar", async (context) => {
   const fixture = await mkdtemp(path.join(os.tmpdir(), "rewind-bridge-"));
@@ -278,6 +281,7 @@ test("live bridge paginates active videos and serves an existing .image sidecar"
     await writeFile(path.join(creatorDir, `${id}.mp4`), `not-a-real-video-${id}`);
   }
   await writeFile(path.join(creatorDir, "1.image"), jpeg);
+  await writeFile(path.join(creatorDir, "3.info.json"), JSON.stringify({ id: "video-3", vcodec: "none" }));
   const instagramDir = path.join(downloads, "instagram");
   await mkdir(instagramDir, { recursive: true });
   await writeFile(path.join(instagramDir, "6-1.jpg"), jpeg);
@@ -385,10 +389,22 @@ test("live bridge paginates active videos and serves an existing .image sidecar"
     },
   ]);
 
+  const coldMediaResponse = await fetch(`http://127.0.0.1:${port}/media/1`, {
+    headers: { range: "bytes=0-3" },
+  });
+  assert.equal(coldMediaResponse.status, 206);
+  assert.equal(await coldMediaResponse.text(), "not-");
+  const coldMediaReads = adminRequests.filter((entry) => entry.url.startsWith("/api/rewind/videos?"));
+  assert.equal(coldMediaReads.length, 1, "cold media should only load the requested archive record");
+  const coldMediaQuery = new URL(coldMediaReads[0].url, "http://backend.test");
+  assert.equal(coldMediaQuery.searchParams.get("fileId"), "1");
+  assert.equal(coldMediaQuery.searchParams.get("limit"), "1");
+
   const firstResponse = await fetch(`http://127.0.0.1:${port}/api/videos?page=1&limit=2`);
   assert.equal(firstResponse.status, 200);
   const firstPage = await firstResponse.json();
-  assert.deepEqual(firstPage.items.map((video) => video.id), ["4", "3"]);
+  assert.deepEqual(firstPage.items.map((video) => video.id), ["4"]);
+  assert.equal(new URL(firstPage.items[0].videoUrl).searchParams.get("playback"), "2");
   assert.equal(typeof firstPage.nextCursor, "string");
 
   const secondResponse = await fetch(
@@ -398,6 +414,19 @@ test("live bridge paginates active videos and serves an existing .image sidecar"
   assert.equal(secondResponse.status, 200, `${JSON.stringify(secondPage)}\n${childOutput}`);
   assert.deepEqual(secondPage.items.map((video) => video.id), ["2", "1"]);
   assert.equal(secondPage.nextCursor, null);
+
+  const singlePage = await (await fetch(`http://127.0.0.1:${port}/api/videos?page=1&limit=1`)).json();
+  const audioOnlyPage = await (await fetch(
+    `http://127.0.0.1:${port}/api/videos?page=1&limit=1&cursor=${encodeURIComponent(singlePage.nextCursor)}`,
+  )).json();
+  assert.deepEqual(audioOnlyPage.items, []);
+  assert.equal(typeof audioOnlyPage.nextCursor, "string", "An audio-only page must not end pagination");
+  const afterAudioOnly = await (await fetch(
+    `http://127.0.0.1:${port}/api/videos?page=1&limit=1&cursor=${encodeURIComponent(audioOnlyPage.nextCursor)}`,
+  )).json();
+  assert.deepEqual(afterAudioOnly.items.map((video) => video.id), ["2"]);
+  const soundtrackDownload = await fetch(`http://127.0.0.1:${port}/media/3?download=1`);
+  assert.equal(await soundtrackDownload.text(), "not-a-real-video-3", "Filtering must preserve original downloads");
 
   const archiveReadsBeforeMedia = adminRequests.filter((entry) => (
     entry.method === "GET" && entry.url.startsWith("/api/rewind/videos?")
@@ -438,6 +467,8 @@ test("live bridge paginates active videos and serves an existing .image sidecar"
   assert.equal(postsPage.items[0].mediaType, "mixed");
   assert.equal(postsPage.items[0].assetCount, 2);
   assert.deepEqual(postsPage.items[0].assets.map((asset) => asset.kind), ["image", "video"]);
+  assert.equal(new URL(postsPage.items[0].assets[0].mediaUrl).searchParams.has("playback"), false);
+  assert.equal(new URL(postsPage.items[0].assets[1].mediaUrl).searchParams.get("playback"), "2");
   assert.deepEqual(postsPage.items[0].tags, ["archive"]);
 
   const postReadsBeforeMedia = adminRequests.filter((entry) => (
@@ -447,10 +478,11 @@ test("live bridge paginates active videos and serves an existing .image sidecar"
   assert.equal(imageResponse.status, 200, childOutput);
   assert.equal(imageResponse.headers.get("content-type"), "image/jpeg");
   assert.deepEqual(Buffer.from(await imageResponse.arrayBuffer()), jpeg);
-  const postVideoResponse = await fetch(postsPage.items[0].assets[1].mediaUrl, {
+  const postVideoResponse = await fetch(`${postsPage.items[0].assets[1].mediaUrl}&download=1`, {
     headers: { range: "bytes=0-3" },
   });
   assert.equal(postVideoResponse.status, 206);
+  assert.match(postVideoResponse.headers.get("content-disposition"), /attachment/);
   assert.equal(Buffer.from(await postVideoResponse.arrayBuffer()).toString(), "not-");
   assert.equal(adminRequests.filter((entry) => (
     entry.method === "GET" && entry.url.startsWith("/api/rewind/posts?")
@@ -560,6 +592,236 @@ test("live bridge paginates active videos and serves an existing .image sidecar"
   assert.equal(unavailableHealth.status, 503);
   assert.deepEqual(await unavailableHealth.json(), { status: "not_ready" });
 });
+
+test("playback media converts incompatible video while preserving original download and range contracts", {
+  timeout: 60_000,
+}, async (context) => {
+  let encoders;
+  try {
+    ({ stdout: encoders } = await runFile("ffmpeg", ["-hide_banner", "-encoders"], { timeout: 5_000 }));
+    await runFile("ffprobe", ["-version"], { timeout: 5_000 });
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    context.skip("FFmpeg and ffprobe are required for real playback media coverage");
+    return;
+  }
+  if (!encoders.includes("libx264") || !encoders.includes("libx265")) {
+    context.skip("FFmpeg must provide libx264 and libx265 encoders");
+    return;
+  }
+
+  const fixture = await mkdtemp(path.join(os.tmpdir(), "rewind-playback-bridge-"));
+  const downloads = path.join(fixture, "downloads");
+  const cache = path.join(fixture, "cache");
+  await mkdir(downloads);
+  context.after(() => rm(fixture, { recursive: true, force: true }));
+  const h264Path = path.join(downloads, "1.mp4");
+  const hevcPath = path.join(downloads, "2.mp4");
+  async function makeVideo(destination, codec, color = "red", size = "96x160") {
+    await runFile("ffmpeg", [
+      "-hide_banner", "-loglevel", "error", "-y",
+      "-f", "lavfi", "-i", `color=c=${color}:size=${size}:rate=24`,
+      "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
+      "-t", "0.5", "-c:v", codec, "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+      ...(codec === "libx265" ? ["-x265-params", "pools=1:frame-threads=1:log-level=error", "-tag:v", "hvc1"] : []),
+      "-c:a", "aac", "-movflags", "+faststart", destination,
+    ], { timeout: 20_000 });
+  }
+  await makeVideo(h264Path, "libx264");
+  await makeVideo(hevcPath, "libx265");
+  await writeFile(path.join(downloads, "3.mp4"), "invalid media must never be cached as playback");
+  const rows = await Promise.all([1, 2, 3].map(async (id) => ({
+    id,
+    video_id: `codec-${id}`,
+    username: "codec-test",
+    path: `/app/data/downloads/${id}.mp4`,
+    filename: `${id}.mp4`,
+    size_bytes: (await stat(path.join(downloads, `${id}.mp4`))).size,
+    created_at: id * 100,
+  })));
+  const backend = http.createServer((request, response) => {
+    const url = new URL(request.url, "http://backend.test");
+    if (url.pathname === "/ready") return sendBackendJson(response, 200, { status: "ready" });
+    if (url.pathname === "/api/rewind/videos") {
+      const id = Number(url.searchParams.get("fileId"));
+      return sendBackendJson(response, 200, { videos: id ? rows.filter((row) => row.id === id) : rows });
+    }
+    if (url.pathname === "/api/rewind/posts") {
+      return sendBackendJson(response, 200, { posts: [{
+        id: 7,
+        platform: "instagram",
+        path: rows[1].path,
+        filename: "2.mp4",
+        assets: [{ ...rows[1], id: 71, kind: "video", role: "content", mime_type: "video/mp4" }],
+      }] });
+    }
+    sendBackendJson(response, 404, { error: "Not found" });
+  });
+  backend.listen(0, "127.0.0.1");
+  await once(backend, "listening");
+  context.after(async () => {
+    backend.close();
+    backend.closeAllConnections();
+    await once(backend, "close");
+  });
+  const port = await availablePort();
+  let child;
+  let childOutput = "";
+  async function startBridge() {
+    child = spawn(process.execPath, [fileURLToPath(new URL("../scripts/live-bridge.mjs", import.meta.url))], {
+      env: {
+        ...process.env,
+        LIVE_LOCAL_MODE: "1",
+        LIVE_BRIDGE_HOST: "127.0.0.1",
+        LIVE_BRIDGE_PORT: String(port),
+        LIVE_DOWNLOADS_PATH: downloads,
+        LIVE_CACHE_PATH: cache,
+        LIVE_BACKEND_URL: `http://127.0.0.1:${backend.address().port}`,
+        LIVE_IMPORT_API_TOKEN: "bridge-secret",
+        LIVE_PUBLIC_BASE_URL: `http://127.0.0.1:${port}`,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { childOutput += chunk; });
+    child.stderr.on("data", (chunk) => { childOutput += chunk; });
+    await waitForBridge(port, child, () => childOutput);
+  }
+  async function stopBridge() {
+    if (child && child.exitCode === null) {
+      const stopped = once(child, "close");
+      child.kill("SIGTERM");
+      await stopped;
+    }
+  }
+  context.after(stopBridge);
+  await startBridge();
+  const origin = `http://127.0.0.1:${port}`;
+
+  const oldVersion = await fetch(`${origin}/media/1?playback=1`, { redirect: "manual" });
+  assert.equal(oldVersion.status, 307);
+  assert.equal(oldVersion.headers.get("location"), "/media/1?playback=2");
+  assert.equal(oldVersion.headers.get("cache-control"), "no-store");
+  assert.equal((await oldVersion.arrayBuffer()).byteLength, 0);
+  const unsupportedVersion = await fetch(`${origin}/media/1?playback=unknown`);
+  assert.equal(unsupportedVersion.status, 400);
+  assert.deepEqual(await unsupportedVersion.json(), { error: "Unsupported playback version" });
+  const compatible = await fetch(`${origin}/media/1?playback=2`);
+  assert.equal(compatible.status, 200, childOutput);
+  assert.deepEqual(Buffer.from(await compatible.arrayBuffer()), await readFile(h264Path));
+  const original = await fetch(`${origin}/media/2`);
+  const originalBytes = Buffer.from(await original.arrayBuffer());
+  assert.deepEqual(originalBytes, await readFile(hevcPath));
+  const [converted, coldHead, coldRange] = await Promise.all([
+    fetch(`${origin}/media/2?playback=2`),
+    fetch(`${origin}/media/2?playback=2`, { method: "HEAD" }),
+    fetch(`${origin}/media/2?playback=2`, { headers: { range: "bytes=0-31" } }),
+  ]);
+  assert.equal(converted.status, 200, childOutput);
+  const convertedBytes = Buffer.from(await converted.arrayBuffer());
+  assert.notDeepEqual(convertedBytes, originalBytes);
+  assert.equal(converted.headers.get("content-type"), "video/mp4");
+  assert.match(converted.headers.get("cache-control"), /immutable/);
+  const convertedEtag = converted.headers.get("etag");
+  assert.notEqual(convertedEtag, original.headers.get("etag"));
+  assert.equal(coldHead.status, 200);
+  assert.equal(coldHead.headers.get("content-length"), String(convertedBytes.length));
+  assert.equal(coldHead.headers.get("etag"), convertedEtag);
+  assert.equal((await coldHead.arrayBuffer()).byteLength, 0);
+  assert.equal(coldRange.status, 206);
+  assert.equal(coldRange.headers.get("etag"), convertedEtag);
+  assert.deepEqual(Buffer.from(await coldRange.arrayBuffer()), convertedBytes.subarray(0, 32));
+  assert.equal((await playbackCacheSnapshot(cache)).length, 1, "Concurrent cold requests must share one completed playback file");
+  const receivedPath = path.join(fixture, "converted.mp4");
+  await writeFile(receivedPath, convertedBytes);
+  const probe = JSON.parse((await runFile("ffprobe", [
+    "-v", "error", "-show_entries", "stream=codec_type,codec_name,pix_fmt", "-of", "json", receivedPath,
+  ], { timeout: 5_000 })).stdout);
+  assert.equal(probe.streams.find((stream) => stream.codec_type === "video")?.codec_name, "h264");
+  assert.equal(probe.streams.find((stream) => stream.codec_type === "video")?.pix_fmt, "yuv420p");
+  assert.equal(probe.streams.find((stream) => stream.codec_type === "audio")?.codec_name, "aac");
+
+  const range = await fetch(`${origin}/media/2?playback=2`, {
+    headers: { range: "bytes=7-31", "if-range": convertedEtag },
+  });
+  assert.equal(range.status, 206);
+  assert.equal(range.headers.get("content-range"), `bytes 7-31/${convertedBytes.length}`);
+  assert.deepEqual(Buffer.from(await range.arrayBuffer()), convertedBytes.subarray(7, 32));
+  const redirectedRange = await fetch(`${origin}/media/2?playback=1`, {
+    headers: { range: "bytes=7-31", "if-range": convertedEtag },
+  });
+  assert.equal(redirectedRange.url, `${origin}/media/2?playback=2`);
+  assert.equal(redirectedRange.status, 206);
+  assert.deepEqual(Buffer.from(await redirectedRange.arrayBuffer()), convertedBytes.subarray(7, 32));
+  const redirectedStaleRange = await fetch(`${origin}/media/2?playback=1`, {
+    headers: { range: "bytes=7-31", "if-range": '"old-playback-version"' },
+  });
+  assert.equal(redirectedStaleRange.status, 200);
+  assert.deepEqual(Buffer.from(await redirectedStaleRange.arrayBuffer()), convertedBytes);
+  const head = await fetch(`${origin}/media/2?playback=2`, { method: "HEAD", headers: { range: "bytes=7-31" } });
+  assert.equal(head.status, 206);
+  assert.equal(head.headers.get("content-length"), "25");
+  assert.equal(head.headers.get("etag"), convertedEtag);
+  assert.equal((await head.arrayBuffer()).byteLength, 0);
+  const redirectedHead = await fetch(`${origin}/media/2?playback=1`, { method: "HEAD", headers: { range: "bytes=7-31" } });
+  assert.equal(redirectedHead.status, 206);
+  assert.equal(redirectedHead.headers.get("content-length"), "25");
+  assert.equal((await redirectedHead.arrayBuffer()).byteLength, 0);
+  const stale = await fetch(`${origin}/media/2?playback=2`, {
+    headers: { range: "bytes=7-31", "if-range": original.headers.get("etag") },
+  });
+  assert.equal(stale.status, 200);
+  assert.deepEqual(Buffer.from(await stale.arrayBuffer()), convertedBytes);
+  const download = await fetch(`${origin}/media/2?playback=2&download=1`);
+  assert.equal(download.status, 200);
+  assert.match(download.headers.get("content-disposition"), /attachment; filename="2\.mp4"/);
+  assert.equal(download.headers.get("etag"), original.headers.get("etag"));
+  assert.deepEqual(Buffer.from(await download.arrayBuffer()), originalBytes);
+  const oldDownload = await fetch(`${origin}/media/2?playback=1&download=1`);
+  assert.equal(oldDownload.status, 200, "Original downloads override obsolete playback policy versions");
+  assert.deepEqual(Buffer.from(await oldDownload.arrayBuffer()), originalBytes);
+  const postPlayback = await fetch(`${origin}/post-media/7/0?playback=2`);
+  assert.equal(postPlayback.status, 200);
+  assert.deepEqual(Buffer.from(await postPlayback.arrayBuffer()), convertedBytes);
+  const postDownload = await fetch(`${origin}/post-download/7?playback=2`);
+  assert.equal(postDownload.status, 200);
+  assert.deepEqual(Buffer.from(await postDownload.arrayBuffer()), originalBytes);
+
+  const beforeRestart = await playbackCacheSnapshot(cache);
+  assert.equal(beforeRestart.length, 1, "Compatible videos pass through without creating a second encoded copy");
+  await stopBridge();
+  await startBridge();
+  const cached = await fetch(`${origin}/media/2?playback=2`);
+  assert.deepEqual(Buffer.from(await cached.arrayBuffer()), convertedBytes);
+  assert.equal(cached.headers.get("etag"), convertedEtag);
+  assert.deepEqual(await playbackCacheSnapshot(cache), beforeRestart, "A bridge restart must reuse the encoded cache file");
+
+  await makeVideo(hevcPath, "libx265", "blue", "128x160");
+  const changed = await fetch(`${origin}/media/2?playback=2`, {
+    headers: { range: "bytes=0-31", "if-range": convertedEtag },
+  });
+  assert.equal(changed.status, 200, "Changed source identity must invalidate old cached ranges");
+  assert.notEqual(changed.headers.get("etag"), convertedEtag);
+  assert.notDeepEqual(Buffer.from(await changed.arrayBuffer()), convertedBytes);
+  const failed = await fetch(`${origin}/media/3?playback=2`);
+  assert.equal(failed.status, 500);
+  assert.match(failed.headers.get("cache-control"), /no-store/);
+  assert.match(failed.headers.get("content-type"), /application\/json/);
+  assert.equal(typeof (await failed.json()).error, "string");
+  const failedDownload = await fetch(`${origin}/media/3?playback=2&download=1`);
+  assert.equal(failedDownload.status, 200);
+  assert.equal(await failedDownload.text(), "invalid media must never be cached as playback");
+  assert.equal((await readdir(cache)).some((filename) => filename.includes(".part-")), false);
+});
+
+async function playbackCacheSnapshot(cache) {
+  const filenames = (await readdir(cache)).filter((filename) => filename.endsWith(".mp4")).sort();
+  return Promise.all(filenames.map(async (name) => {
+    const file = await stat(path.join(cache, name));
+    return { name, size: file.size, mtimeMs: file.mtimeMs };
+  }));
+}
 
 async function availablePort() {
   const server = createServer();

@@ -1,9 +1,9 @@
 # Fork roadmap
 
-This page tracks contributions proposed from this fork. Each proposal's code
-lives on a separate feature branch. The default `main` branch contains this
-roadmap and the README notice, but none of the feature code below. Use the
-upstream PR pages for current review and merge status.
+This page tracks contributions proposed from this fork. Each proposal retains
+its own feature branch for upstream review. The fork's `main` and
+`release/combined-preview` branches contain the tested combined integration.
+Use the upstream PR pages for current review and merge status.
 
 ## Submitted upstream
 
@@ -81,17 +81,19 @@ optional LIVE behaviors to run.
 ## Combined fork preview
 
 The [combined preview branch](https://github.com/TheocritusHF/tiktok-dlp/tree/release/combined-preview)
-contains PRs #23–#29 in one checkout, with a separate
-[installation guide](https://github.com/TheocritusHF/tiktok-dlp/blob/release/combined-preview/RELEASE_PREVIEW.md).
-The integrated backend passed 260 tests. The current fixed snapshot is
-[`v0.1.0-preview.2`](https://github.com/TheocritusHF/tiktok-dlp/releases/tag/v0.1.0-preview.2);
-the earlier `.1` snapshot remains at its original commit. This is a fork preview,
-not an upstream merge. Its optional features remain disabled until configured. Back up an existing archive before
-upgrading, since #25 adds a SQLite migration.
+contains PRs #23–#29 together with the tested upstream integration, with a
+separate [installation guide](https://github.com/TheocritusHF/tiktok-dlp/blob/release/combined-preview/RELEASE_PREVIEW.md).
+The Docker backend test run passed 337 tests with one skip, and the live trial
+confirmed quality upgrades, Discord notifications, and LIVE recording. The
+[`v0.1.0-preview.2`](https://github.com/TheocritusHF/tiktok-dlp/releases/tag/v0.1.0-preview.2)
+tag is a fixed earlier snapshot; the branch has newer changes. This is a fork
+integration, not an upstream release. Its optional features remain disabled
+until configured. Back up an existing archive before upgrading, since #25
+adds a SQLite migration.
 
-The fork's default `main` still contains only the overview and roadmap, not
-the combined feature code. Individual PR branches remain separate for upstream
-review and can change independently of the combined preview.
+The fork's default `main` includes the combined feature code and this roadmap.
+Individual PR branches remain separate for upstream review and can change
+independently of the combined integration.
 
 Fork-specific roadmap changes stay out of upstream feature PRs unless upstream
 asks for them.

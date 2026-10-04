@@ -17,7 +17,7 @@ import {
 } from "lucide-react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type ComponentProps, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { CreatorPicker } from "../CreatorPicker";
 import { resolveCreatorId } from "../../lib/creator-id";
 import { mockStats } from "../../lib/mock-data";
@@ -42,8 +42,11 @@ const FEED_HINT_STORAGE_KEY = "rewind-feed-hint-seen";
 const VIDEO_PAGE_SIZE = 36;
 const CARD_WINDOW_SIZE = 7;
 const CARD_WINDOW_BEHIND = 3;
-const PRELOAD_AHEAD = 2;
 const PLAYABLE_READY_STATE = 2;
+const PRELOAD_BUFFER_SECONDS = 5;
+const CANDIDATE_BUFFER_SECONDS = 3;
+const SWIPE_ANTICIPATION_FRACTION = 0.1;
+const PLAYBACK_WAIT_TIMEOUT_MS = 15_000;
 const KEYBOARD_SEEK_SECONDS = 5;
 
 export function MobileFeed({ creators, videos }: MobileFeedProps) {
@@ -86,6 +89,11 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
   const [playbackError, setPlaybackError] = useState("");
   const [presentedVideoId, setPresentedVideoId] = useState("");
   const [preloadReadyVideoId, setPreloadReadyVideoId] = useState("");
+  const [residentVideoIds, setResidentVideoIds] = useState<string[]>([]);
+  const [bufferedVideoIds, setBufferedVideoIds] = useState<Set<string>>(() => new Set());
+  const [scrollDirection, setScrollDirection] = useState<1 | -1>(1);
+  const [scrollCandidateId, setScrollCandidateId] = useState("");
+  const [pageVisible, setPageVisible] = useState(true);
   const [controlsVisible, setControlsVisible] = useState(false);
   const [menuVideoId, setMenuVideoId] = useState("");
   const [feedView, setFeedView] = useState<"all" | "bookmarks">("all");
@@ -100,13 +108,16 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
   const [removedVideoIds, setRemovedVideoIds] = useState<Set<string>>(() => new Set());
   const videoRefs = useRef(new Map<string, HTMLVideoElement>());
   const activeIdRef = useRef(activeId);
+  const scrollDirectionRef = useRef<1 | -1>(1);
   const failedVideoIdsRef = useRef(new Set<string>());
-  const skipMutedPreferenceWrite = useRef(false);
+  const soundChoiceRevision = useRef(0);
   const feedScrollerRef = useRef<HTMLDivElement>(null);
   const progressRef = useRef<HTMLSpanElement>(null);
   const seekRef = useRef<HTMLInputElement>(null);
+  const scrubbingVideoIdRef = useRef("");
   const actionMenuRef = useRef<HTMLDivElement>(null);
   const pendingBookmarkFocusRef = useRef<string | null>(null);
+  const bookmarkPageStartRef = useRef<number | null>(null);
   const wasPausedBeforeDeleteRef = useRef(false);
   const { dialogRef, returnFocusRef } = useModalDialog(Boolean(deleteVideo), closeDeleteVideo);
 
@@ -147,15 +158,17 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
   );
   const bookmarkedCreatorVideos = useMemo(
     () => {
+      if (!archive.bookmarkedVideosLoaded) return [];
       const videosForCreator = resolvedCreatorId === "all"
         ? orderedBookmarkedVideos
         : orderedBookmarkedVideos.filter((video) => video.creatorId === resolvedCreatorId);
       return videosForCreator.filter((video) => saved.has(video.id));
     },
-    [orderedBookmarkedVideos, resolvedCreatorId, saved],
+    [archive.bookmarkedVideosLoaded, orderedBookmarkedVideos, resolvedCreatorId, saved],
   );
   const filteredVideos = feedView === "bookmarks" ? bookmarkedCreatorVideos : allCreatorVideos;
   const bookmarkError = bookmarks.error || archive.bookmarkedVideosError;
+  const feedError = bookmarkError || archive.error;
   const bookmarkPagePending = feedView === "bookmarks"
     && !bookmarkError
     && (!bookmarksReady || !archive.bookmarkedVideosLoaded || loadingBookmarkedVideos);
@@ -169,8 +182,17 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
     : requestedVideoPending
       ? ""
       : filteredVideos[0]?.id ?? "";
+  // Audio can alternate between playing and waiting without presenting a frame.
+  const waitingForPlayback = buffering || presentedVideoId !== currentActiveId;
   const activeIndex = filteredVideos.findIndex((video) => video.id === currentActiveId);
   const activeVideo = activeIndex >= 0 ? filteredVideos[activeIndex] : undefined;
+  const scrollCandidateIndex = filteredVideos.findIndex((video) => video.id === scrollCandidateId);
+  const incomingVideoId = Math.abs(scrollCandidateIndex - activeIndex) === 1 ? scrollCandidateId : "";
+  const directionNeighbor = filteredVideos[activeIndex + scrollDirection] || filteredVideos[activeIndex - scrollDirection];
+  const preloadVideoId = incomingVideoId || directionNeighbor?.id || "";
+  const canPreload = Boolean(currentActiveId) && pageVisible && !paused && (
+    Boolean(incomingVideoId) || (preloadReadyVideoId === currentActiveId && !buffering)
+  );
   const windowAnchor = Math.max(activeIndex, 0);
   const unclampedWindowStart = Math.max(0, windowAnchor - CARD_WINDOW_BEHIND);
   const windowStart = Math.max(
@@ -183,28 +205,32 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
     [filteredVideos, windowEnd, windowStart],
   );
 
-  const playIfReady = useCallback((id: string, video: HTMLVideoElement) => {
-    if (!mutePreferenceReady || id !== currentActiveId || id !== activeIdRef.current || paused) return;
+  const playIfReady = useCallback((id: string, video: HTMLVideoElement, userInitiated = false) => {
+    if (
+      !mutePreferenceReady
+      || !video.isConnected
+      || id !== currentActiveId
+      || id !== activeIdRef.current
+      || (paused && !userInitiated)
+      || document.visibilityState === "hidden"
+    ) return;
 
+    if (userInitiated) soundChoiceRevision.current += 1;
+    const soundRevision = soundChoiceRevision.current;
     video.muted = muted;
-    if (video.readyState < PLAYABLE_READY_STATE) {
-      // Keep the poster visible and audio stopped until a video frame and a
-      // small forward buffer are decoded. Safari can otherwise start AAC
-      // playback several seconds before a heavier H.264/HEVC frame appears.
-      video.pause();
-      setBuffering(true);
-      if (video.networkState === HTMLMediaElement.NETWORK_EMPTY) video.load();
-      return;
-    }
-
+    // Mobile browsers may defer preload until play() is requested. Keep the
+    // poster until a frame arrives, but never wait for that frame to call play().
+    if (video.readyState < PLAYABLE_READY_STATE) setBuffering(true);
     video.play().catch((error: unknown) => {
-      if (isAbortError(error) || id !== activeIdRef.current) return;
-      if (!video.muted && isAutoplayPolicyError(error)) {
+      if (isAbortError(error) || !video.isConnected || id !== activeIdRef.current
+        || soundRevision !== soundChoiceRevision.current) return;
+      // A fresh page may need muted autoplay, but never undo a sound/play tap.
+      if (!video.muted && isAutoplayPolicyError(error) && soundRevision === 0) {
         video.muted = true;
-        skipMutedPreferenceWrite.current = true;
         setMuted(true);
         void video.play().catch((retryError: unknown) => {
-          if (isAbortError(retryError) || id !== activeIdRef.current) return;
+          if (isAbortError(retryError) || !video.isConnected || id !== activeIdRef.current
+            || soundRevision !== soundChoiceRevision.current) return;
           setPaused(true);
           setPlaybackError("Playback was blocked. Tap play to retry.");
         });
@@ -214,6 +240,14 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
       setPlaybackError("This video could not start. Tap play to retry.");
     });
   }, [currentActiveId, mutePreferenceReady, muted, paused]);
+
+  const prepareNextVideo = useCallback((id: string, video: HTMLVideoElement) => {
+    if (id === activeIdRef.current) setPreloadReadyVideoId(hasPlaybackBuffer(video) ? id : "");
+    if (hasPlaybackBuffer(video, CANDIDATE_BUFFER_SECONDS)) {
+      if (id !== activeIdRef.current) video.preload = "none";
+      setBufferedVideoIds((current) => current.has(id) ? current : new Set(current).add(id));
+    }
+  }, []);
 
   useEffect(() => {
     // Live production data arrives after hydration, so choosing the seed here
@@ -251,18 +285,34 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
   }, [requestedVideoId]);
 
   useEffect(() => {
-    if (!mutePreferenceReady) return;
-    if (skipMutedPreferenceWrite.current) {
-      skipMutedPreferenceWrite.current = false;
-      return;
-    }
-    writeMutedPreference(window.localStorage, muted);
-  }, [mutePreferenceReady, muted]);
-
-  useEffect(() => {
     if (feedView !== "bookmarks" || !bookmarksReady) return;
     void loadBookmarkedVideos();
   }, [bookmarks.serverRevision, bookmarksReady, feedView, loadBookmarkedVideos]);
+
+  useLayoutEffect(() => {
+    const pageStart = bookmarkPageStartRef.current;
+    if (pageStart === null || loadingBookmarkedVideos) return;
+    bookmarkPageStartRef.current = null;
+    const scroller = feedScrollerRef.current;
+    if (!scroller) return;
+    if (feedView !== "bookmarks" || !filteredVideos[pageStart]) {
+      scroller.style.scrollSnapType = "";
+      return;
+    }
+    // Safari can follow the old snapped footer to the end of the appended page.
+    scroller.scrollTo({ top: pageStart * scroller.clientHeight, behavior: "instant" });
+    const frame = window.requestAnimationFrame(() => { scroller.style.scrollSnapType = ""; });
+    return () => {
+      window.cancelAnimationFrame(frame);
+      scroller.style.scrollSnapType = "";
+    };
+  }, [feedView, filteredVideos, loadingBookmarkedVideos]);
+
+  function loadNextBookmarkPage() {
+    bookmarkPageStartRef.current = filteredVideos.length;
+    if (feedScrollerRef.current) feedScrollerRef.current.style.scrollSnapType = "none";
+    void loadMoreBookmarkedVideos();
+  }
 
   useEffect(() => {
     activeIdRef.current = currentActiveId;
@@ -352,59 +402,149 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
 
   useEffect(() => {
     if (!shuffleReady) return;
-    const nodes = Array.from(
-      feedScrollerRef.current?.querySelectorAll<HTMLElement>("[data-feed-card]") || [],
-    );
-    const observer = new IntersectionObserver(
-      (entries) => {
-        const visible = entries
-          .filter((entry) => entry.isIntersecting)
-          .sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
-        const id = visible?.target.getAttribute("data-video-id");
-        if (id && requestedJumpHandled.current && id !== activeIdRef.current) {
-          activeIdRef.current = id;
-          const nextVideo = videoRefs.current.get(id);
-          const failed = failedVideoIdsRef.current.has(id);
-          setActiveId(id);
-          setPreloadReadyVideoId(
-            !failed && (nextVideo?.readyState ?? 0) >= PLAYABLE_READY_STATE ? id : "",
-          );
-          setPaused(failed || !autoplayEnabled);
-          setBuffering(!failed);
-          setPlaybackError(failed ? "This archived file could not be played." : "");
-          setPresentedVideoId("");
-          setControlsVisible(false);
-          setMenuVideoId("");
-          if (progressRef.current) progressRef.current.style.width = "0%";
-          if (seekRef.current) seekRef.current.value = "0";
-        }
-      },
-      { threshold: [0.65, 0.82] },
-    );
-    nodes.forEach((node) => observer.observe(node));
-    return () => observer.disconnect();
-  }, [autoplayEnabled, renderedVideos, shuffleReady]);
+    const scroller = feedScrollerRef.current;
+    if (!scroller) return;
+    let frame = 0;
+    let previousTop = scroller.scrollTop;
+
+    function updateScrollPosition() {
+      frame = 0;
+      if (!scroller || !requestedJumpHandled.current || !filteredVideos.length || !scroller.clientHeight) return;
+      const top = Math.max(0, scroller.scrollTop);
+      const movement = top - previousTop;
+      previousTop = top;
+      if (Math.abs(movement) > 1) {
+        scrollDirectionRef.current = movement > 0 ? 1 : -1;
+        setScrollDirection(scrollDirectionRef.current);
+      }
+      const position = top / scroller.clientHeight;
+      const index = Math.max(0, Math.min(filteredVideos.length - 1, Math.round(position)));
+      const id = filteredVideos[index].id;
+      const direction = scrollDirectionRef.current;
+      const candidateIndex = direction > 0 ? Math.ceil(position) : Math.floor(position);
+      const movingTowardCandidate = direction > 0
+        ? position - index >= SWIPE_ANTICIPATION_FRACTION
+        : index - position >= SWIPE_ANTICIPATION_FRACTION;
+      setScrollCandidateId(movingTowardCandidate && candidateIndex !== index
+        ? filteredVideos[candidateIndex]?.id || ""
+        : "");
+
+      if (id === activeIdRef.current) return;
+      videoRefs.current.get(activeIdRef.current)?.pause();
+      activeIdRef.current = id;
+      const nextVideo = videoRefs.current.get(id);
+      const failed = failedVideoIdsRef.current.has(id);
+      const frameReady = !failed && (nextVideo?.readyState ?? 0) >= PLAYABLE_READY_STATE
+        && (nextVideo?.videoWidth ?? 0) > 0;
+      setActiveId(id);
+      setPreloadReadyVideoId(!failed && nextVideo && hasPlaybackBuffer(nextVideo) ? id : "");
+      setPaused(failed || !autoplayEnabled);
+      setBuffering(!failed && !frameReady);
+      setPlaybackError(failed ? "This archived file could not be played." : "");
+      setPresentedVideoId(frameReady ? id : "");
+      setControlsVisible(false);
+      setMenuVideoId("");
+      if (progressRef.current) progressRef.current.style.width = "0%";
+      if (seekRef.current) seekRef.current.value = "0";
+    }
+
+    function scheduleScrollUpdate() {
+      if (!frame) frame = window.requestAnimationFrame(updateScrollPosition);
+    }
+
+    // Position remains observable even when a fling reaches a virtual spacer.
+    scroller.addEventListener("scroll", scheduleScrollUpdate, { passive: true });
+    const observer = new ResizeObserver(scheduleScrollUpdate);
+    observer.observe(scroller);
+    scheduleScrollUpdate();
+    return () => {
+      scroller.removeEventListener("scroll", scheduleScrollUpdate);
+      observer.disconnect();
+      if (frame) window.cancelAnimationFrame(frame);
+    };
+  }, [autoplayEnabled, filteredVideos, shuffleReady]);
 
   useEffect(() => {
     if (!shuffleReady) return;
-    for (const [id, video] of videoRefs.current) {
-      if (id === currentActiveId && !paused) {
-        playIfReady(id, video);
-      } else {
-        video.pause();
+    function syncPlayback() {
+      setPageVisible(document.visibilityState !== "hidden");
+      for (const [id, video] of videoRefs.current) {
+        if (id === currentActiveId && !paused && document.visibilityState !== "hidden") {
+          playIfReady(id, video);
+        } else {
+          video.pause();
+        }
       }
     }
+    function pausePlayback() {
+      setPageVisible(false);
+      for (const video of videoRefs.current.values()) video.pause();
+    }
+    syncPlayback();
+    document.addEventListener("visibilitychange", syncPlayback);
+    window.addEventListener("pageshow", syncPlayback);
+    window.addEventListener("pagehide", pausePlayback);
+    return () => {
+      document.removeEventListener("visibilitychange", syncPlayback);
+      window.removeEventListener("pageshow", syncPlayback);
+      window.removeEventListener("pagehide", pausePlayback);
+    };
   }, [currentActiveId, muted, paused, playIfReady, shuffleReady]);
 
   useEffect(() => {
-    if (activeIndex < 0) return;
+    if (
+      !currentActiveId || !mutePreferenceReady || !pageVisible || paused
+      || !waitingForPlayback
+    ) return;
+    const waitingVideo = videoRefs.current.get(currentActiveId);
+    let canceled = false;
+    const frame = waitingVideo?.requestVideoFrameCallback?.(() => {
+      if (canceled || activeIdRef.current !== currentActiveId || waitingVideo.paused
+        || document.visibilityState === "hidden") return;
+      window.clearTimeout(timer);
+      setPresentedVideoId(currentActiveId);
+      setBuffering(false);
+    });
+    const timer = window.setTimeout(() => {
+      const video = videoRefs.current.get(currentActiveId);
+      if (activeIdRef.current !== currentActiveId || !video || document.visibilityState === "hidden") return;
+      video.pause();
+      setPaused(true);
+      setBuffering(false);
+      setPreloadReadyVideoId("");
+      setPlaybackError("Video is taking too long to load. Tap retry.");
+      setControlsVisible(true);
+    }, PLAYBACK_WAIT_TIMEOUT_MS);
+    return () => {
+      canceled = true;
+      window.clearTimeout(timer);
+      if (frame !== undefined) waitingVideo?.cancelVideoFrameCallback(frame);
+    };
+  }, [currentActiveId, mutePreferenceReady, pageVisible, paused, waitingForPlayback]);
 
-    const lastIndex = Math.min(filteredVideos.length - 1, activeIndex + PRELOAD_AHEAD);
-    for (let index = activeIndex; index <= lastIndex; index += 1) {
-      const video = videoRefs.current.get(filteredVideos[index].id);
-      if (video?.networkState === HTMLMediaElement.NETWORK_EMPTY) video.load();
-    }
-  }, [activeIndex, filteredVideos]);
+  useEffect(() => {
+    // Preserve the previous player's buffer and position without fetching unseen
+    // older videos. Only one incoming player may fetch speculative media.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setResidentVideoIds((current) => {
+      const neighbors = filteredVideos.slice(Math.max(0, activeIndex - 1), activeIndex + 2);
+      const next = neighbors
+        .filter((video) => video.id === currentActiveId
+          || current.includes(video.id)
+          || (canPreload && video.id === preloadVideoId))
+        .map((video) => video.id);
+      return next.length === current.length && next.every((id, index) => id === current[index]) ? current : next;
+    });
+  }, [activeIndex, canPreload, currentActiveId, filteredVideos, preloadVideoId]);
+
+  useEffect(() => {
+    // Keep readiness bookkeeping bounded to the same small player window.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setBufferedVideoIds((current) => {
+      const next = new Set([...current].filter((id) => id === currentActiveId || residentVideoIds.includes(id)));
+      return next.size === current.size ? current : next;
+    });
+  }, [currentActiveId, residentVideoIds]);
 
   useEffect(() => {
     if (
@@ -416,30 +556,42 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
     void loadMoreVideos();
   }, [activeIndex, feedView, filteredVideos.length, hasMoreVideos, loadingMoreVideos, loadMoreVideos]);
 
-  const setVideoRef = useCallback(
-    (id: string, node: HTMLVideoElement | null) => {
-      if (node) videoRefs.current.set(id, node);
-      else videoRefs.current.delete(id);
-    },
-    [],
-  );
+  const setVideoRef = useCallback((id: string, node: HTMLVideoElement | null) => {
+    if (node) {
+      videoRefs.current.set(id, node);
+      return;
+    }
+    const retiredVideo = videoRefs.current.get(id);
+    videoRefs.current.delete(id);
+    // Removing a playing element alone does not reliably abort its request.
+    if (retiredVideo) {
+      retiredVideo.pause();
+      retiredVideo.removeAttribute("src");
+      retiredVideo.load();
+    }
+  }, []);
 
   const resetFeedPosition = useCallback((
     nextActiveId: string,
     { scrollToTop = true, showControls = false }: { scrollToTop?: boolean; showControls?: boolean } = {},
   ) => {
+    bookmarkPageStartRef.current = null;
+    if (feedScrollerRef.current) feedScrollerRef.current.style.scrollSnapType = "";
+    scrollDirectionRef.current = 1;
+    setScrollDirection(1);
+    setScrollCandidateId("");
     if (scrollToTop) feedScrollerRef.current?.scrollTo({ top: 0, behavior: "auto" });
     activeIdRef.current = nextActiveId;
     setActiveId(nextActiveId);
     if (nextActiveId !== currentActiveId) {
       const failed = failedVideoIdsRef.current.has(nextActiveId);
       const nextElement = videoRefs.current.get(nextActiveId);
-      setPaused(!nextActiveId || failed || !autoplayEnabled);
+      setPaused(failed || !autoplayEnabled);
       setBuffering(Boolean(nextActiveId) && !failed);
       setPlaybackError(failed ? "This archived file could not be played." : "");
       setPresentedVideoId("");
       setPreloadReadyVideoId(
-        !failed && (nextElement?.readyState ?? 0) >= PLAYABLE_READY_STATE ? nextActiveId : "",
+        !failed && nextElement && hasPlaybackBuffer(nextElement) ? nextActiveId : "",
       );
       if (progressRef.current) progressRef.current.style.width = "0%";
       if (seekRef.current) seekRef.current.value = "0";
@@ -519,7 +671,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
       activeIdRef.current = nextId;
       setActiveId(nextId);
       setPreloadReadyVideoId(
-        !nextFailed && (nextElement?.readyState ?? 0) >= PLAYABLE_READY_STATE ? nextId : "",
+        !nextFailed && nextElement && hasPlaybackBuffer(nextElement) ? nextId : "",
       );
       setPaused(!autoplayEnabled || !nextId || nextFailed);
       setBuffering(Boolean(nextId) && !nextFailed);
@@ -564,6 +716,15 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
     resetFeedPosition(nextVideos[0]?.id || "");
   }
 
+  function retryFeed() {
+    if (bookmarkError) {
+      if (archive.bookmarkedVideosError) void loadBookmarkedVideos();
+      bookmarks.retry();
+    } else {
+      archive.retry();
+    }
+  }
+
   function shuffleFeed() {
     const nextSeed = randomFeedSeed();
     const sourceVideos = feedView === "bookmarks" ? liveBookmarkedVideos : allLiveVideos;
@@ -580,9 +741,11 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
 
   const toggleMute = useCallback(() => {
     const nextMuted = !muted;
+    soundChoiceRevision.current += 1;
     const activeVideo = videoRefs.current.get(currentActiveId);
     if (activeVideo) activeVideo.muted = nextMuted;
     setMuted(nextMuted);
+    writeMutedPreference(window.localStorage, nextMuted);
   }, [currentActiveId, muted]);
 
   const retryPlayback = useCallback(() => {
@@ -598,7 +761,10 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
       setPreloadReadyVideoId("");
       activeVideo.load();
     }
-  }, [currentActiveId, playbackError]);
+    // Keep play() inside the tap/keyboard gesture so Safari can authorize sound
+    // even when the media is still loading.
+    if (activeVideo) playIfReady(currentActiveId, activeVideo, true);
+  }, [currentActiveId, playbackError, playIfReady]);
 
   useEffect(() => {
     function handleFeedShortcut(event: KeyboardEvent) {
@@ -671,6 +837,13 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
   }, [activeIndex, currentActiveId, deleteVideo, feedView, filteredVideos, hasMoreVideos, loadMoreVideos, paused, retryPlayback, toggleMute, toggleSaved]);
 
   const showControlBar = controlsVisible || !controlsAvailable;
+
+  function seekToPercentage(id: string, percentage: number) {
+    const element = videoRefs.current.get(id);
+    if (id !== activeIdRef.current || !element || !Number.isFinite(element.duration) || element.duration <= 0) return;
+    element.currentTime = element.duration * percentage / 100;
+    if (progressRef.current) progressRef.current.style.width = `${percentage}%`;
+  }
 
   return (
     <main className={styles.appShell}>
@@ -746,15 +919,9 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
               </button>
             </div>
           </div>
-          {archive.error ? (
-            <div className={styles.feedNotice} role="alert">
-              <span>{archive.error}</span>
-              <button type="button" onClick={archive.refresh}>Retry</button>
-            </div>
-          ) : null}
         </div>
 
-        {hintVisible && controlsAvailable ? (
+        {hintVisible && controlsAvailable && !feedError ? (
           <p className={styles.feedHint} role="status">Tap for controls · swipe to browse</p>
         ) : null}
 
@@ -765,25 +932,16 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
         ) : null}
 
         <div id="feed-video-list" className={styles.feedScroller} ref={feedScrollerRef}>
-          {windowStart > 0 ? (
-            <div
-              className={styles.feedSpacer}
-              style={{ height: `${windowStart * 100}%` }}
-              aria-hidden="true"
-            />
-          ) : null}
+          {filteredVideos.map((video) => (
+            <div key={`snap-${video.id}`} className={styles.feedSnap} aria-hidden="true" />
+          ))}
           {renderedVideos.map((video, windowIndex) => {
             const index = windowStart + windowIndex;
             const isActive = video.id === currentActiveId;
-            // Give the first visible video the connection to itself. Once its
-            // first frame starts, preload the next two cards. Keeping older and
-            // farther cards poster-only prevents competing media streams.
-            const shouldPreload = isActive
-              || (
-                preloadReadyVideoId === currentActiveId
-                && index > activeIndex
-                && index <= activeIndex + PRELOAD_AHEAD
-              );
+            const keepPlayer = isActive || (canPreload && video.id === preloadVideoId) || (
+              Math.abs(index - activeIndex) <= 1 && residentVideoIds.includes(video.id)
+            );
+            const warmPlayer = canPreload && video.id === preloadVideoId && !bufferedVideoIds.has(video.id);
             const isSaved = saved.has(video.id);
             const showControls = isActive && controlsVisible;
             return (
@@ -792,53 +950,57 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
                 data-feed-card
                 data-video-id={video.id}
                 key={video.id}
-                style={{ "--wash": video.accent } as React.CSSProperties}
+                style={{ "--wash": video.accent, top: `${index * 100}%` } as React.CSSProperties}
                 aria-label={isActive ? `${video.title} by @${video.username}` : undefined}
                 aria-hidden={!isActive}
                 inert={!isActive ? true : undefined}
               >
-                {shouldPreload ? (
-                  <video
+                {keepPlayer ? (
+                  <FeedVideo
                     className={styles.video}
-                    ref={(node) => setVideoRef(video.id, node)}
+                    videoId={video.id}
+                    onVideoRef={setVideoRef}
                     src={video.videoUrl}
                     muted={muted}
-                    loop
                     playsInline
-                    preload="auto"
+                    preload={pageVisible && (isActive || warmPlayer) ? "auto" : "none"}
                     aria-hidden="true"
                     onTimeUpdate={(event) => {
-                      if (activeIdRef.current !== video.id) return;
+                      if (activeIdRef.current !== video.id || scrubbingVideoIdRef.current === video.id) return;
                       const element = event.currentTarget;
+                      prepareNextVideo(video.id, element);
                       const value = element.duration ? element.currentTime / element.duration : 0;
                       if (progressRef.current) {
                         progressRef.current.style.width = `${Math.max(0, Math.min(1, value)) * 100}%`;
                       }
                       if (seekRef.current) seekRef.current.value = String(value * 100);
                     }}
-                    onLoadedData={(event) => playIfReady(video.id, event.currentTarget)}
-                    onCanPlay={(event) => {
-                      if (activeIdRef.current === video.id) setPreloadReadyVideoId(video.id);
-                      playIfReady(video.id, event.currentTarget);
-                    }}
+                    onLoadedData={(event) => prepareNextVideo(video.id, event.currentTarget)}
+                    onCanPlay={(event) => prepareNextVideo(video.id, event.currentTarget)}
+                    onProgress={(event) => prepareNextVideo(video.id, event.currentTarget)}
+                    onEnded={(event) => playIfReady(video.id, event.currentTarget)}
                     onPlaying={(event) => {
-                      if (activeIdRef.current !== video.id) return;
                       const element = event.currentTarget;
+                      if (activeIdRef.current !== video.id || document.visibilityState === "hidden") {
+                        element.pause();
+                        return;
+                      }
                       failedVideoIdsRef.current.delete(video.id);
-                      setBuffering(false);
                       setPlaybackError("");
                       setPaused(false);
-                      setPreloadReadyVideoId(video.id);
-                      if (typeof element.requestVideoFrameCallback === "function") {
-                        element.requestVideoFrameCallback(() => {
-                          if (activeIdRef.current === video.id) setPresentedVideoId(video.id);
-                        });
-                      } else {
+                      prepareNextVideo(video.id, element);
+                      // A playing event can arrive while the picture is still
+                      // stalled. Only the frame callback clears that wait.
+                      if (typeof element.requestVideoFrameCallback !== "function" && element.videoWidth > 0) {
                         setPresentedVideoId(video.id);
+                        setBuffering(false);
                       }
                     }}
                     onWaiting={() => {
-                      if (activeIdRef.current === video.id) setBuffering(true);
+                      if (activeIdRef.current === video.id) {
+                        setBuffering(true);
+                        setPreloadReadyVideoId("");
+                      }
                     }}
                     onError={() => {
                       failedVideoIdsRef.current.add(video.id);
@@ -850,14 +1012,12 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
                     }}
                   />
                 ) : null}
-                {video.thumbnailUrl ? (
-                  // Thumbnails stay lazy while preventing black cards during fast scrolling.
+                {video.thumbnailUrl && Math.abs(index - activeIndex) <= 1 ? (
                   // eslint-disable-next-line @next/next/no-img-element
                   <img
                     className={`${styles.videoPoster} ${presentedVideoId === video.id ? styles.videoPosterHidden : ""}`}
                     src={video.thumbnailUrl}
                     alt=""
-                    loading={isActive || index === activeIndex + 1 ? "eager" : "lazy"}
                     fetchPriority={isActive ? "high" : "low"}
                     decoding="async"
                   />
@@ -975,26 +1135,25 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
                     disabled={!isActive}
                     tabIndex={isActive ? 0 : -1}
                     aria-label={`Seek ${video.title}`}
+                    onPointerDown={() => {
+                      scrubbingVideoIdRef.current = video.id;
+                    }}
+                    onPointerUp={(event) => {
+                      if (scrubbingVideoIdRef.current !== video.id) return;
+                      scrubbingVideoIdRef.current = "";
+                      seekToPercentage(video.id, Number(event.currentTarget.value));
+                    }}
+                    onLostPointerCapture={() => { scrubbingVideoIdRef.current = ""; }}
                     onInput={(event) => {
-                      const element = videoRefs.current.get(video.id);
                       const percentage = Number(event.currentTarget.value);
-                      if (!element || !Number.isFinite(element.duration) || element.duration <= 0) return;
-                      element.currentTime = element.duration * percentage / 100;
                       if (progressRef.current) progressRef.current.style.width = `${percentage}%`;
+                      if (scrubbingVideoIdRef.current !== video.id) seekToPercentage(video.id, percentage);
                     }}
                   />
                 </div>
               </article>
             );
           })}
-          {windowEnd < filteredVideos.length ? (
-            <div
-              className={styles.feedSpacer}
-              style={{ height: `${(filteredVideos.length - windowEnd) * 100}%` }}
-              aria-hidden="true"
-            />
-          ) : null}
-
           {filteredVideos.length === 0 ? (
             <div className={styles.emptyFeed}>
               <h2>
@@ -1002,26 +1161,28 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
                   ? "Could not load bookmarks"
                   : bookmarkPagePending
                     ? "Loading bookmarks…"
+                  : archive.error
+                    ? "Could not load the archive"
                   : archive.source === "loading" || archive.source === "refreshing"
                   ? "Loading videos…"
-                  : archive.source === "error"
-                    ? "Could not load the archive"
-                    : feedView === "bookmarks" ? "No bookmarks" : "No saved videos"}
+                  : feedView === "bookmarks" ? "No bookmarks" : "No saved videos"}
               </h2>
-              <p>
+              <p role={archive.error || (feedView === "bookmarks" && bookmarkError) ? "alert" : undefined}>
                 {feedView === "bookmarks" && bookmarkError
                   ? bookmarkError
-                  : archive.source === "error"
+                  : archive.error
                   ? archive.error
                   : bookmarkPagePending
                     ? "Loading your server bookmarks."
+                  : archive.source === "loading" || archive.source === "refreshing"
+                  ? ""
                   : feedView === "bookmarks"
                   ? "Bookmark a video and it will appear here."
                   : "There are no files for this creator."}
               </p>
               <div className={styles.emptyActions}>
-                {archive.source === "error" ? (
-                  <button type="button" onClick={archive.refresh}>Retry</button>
+                {archive.error && !(feedView === "bookmarks" && bookmarkError) ? (
+                  <button type="button" onClick={archive.retry}>Retry</button>
                 ) : null}
                 {resolvedCreatorId !== "all" ? (
                   <button type="button" onClick={() => selectCreator("all")}>All creators</button>
@@ -1029,10 +1190,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
                 {feedView === "bookmarks" && bookmarkError ? (
                   <button
                     type="button"
-                    onClick={() => {
-                      if (archive.bookmarkedVideosError) void loadBookmarkedVideos();
-                      bookmarks.retry();
-                    }}
+                    onClick={retryFeed}
                   >
                     Retry bookmarks
                   </button>
@@ -1043,7 +1201,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
                       aria-controls="feed-video-list"
                       aria-busy={loadingBookmarkedVideos}
                       disabled={loadingBookmarkedVideos}
-                      onClick={() => void loadMoreBookmarkedVideos()}
+                      onClick={loadNextBookmarkPage}
                     >
                       {loadingBookmarkedVideos ? "Loading more bookmarks…" : "Load more bookmarks"}
                     </button>
@@ -1065,7 +1223,7 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
                   aria-controls="feed-video-list"
                   aria-busy={loadingBookmarkedVideos}
                   disabled={loadingBookmarkedVideos}
-                  onClick={() => void loadMoreBookmarkedVideos()}
+                  onClick={loadNextBookmarkPage}
                 >
                   {loadingBookmarkedVideos ? "Loading more bookmarks…" : "Load more bookmarks"}
                 </button>
@@ -1078,18 +1236,18 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
         {loadingMoreVideos ? (
           <p className="sr-only" role="status">Loading more videos…</p>
         ) : null}
-        {bookmarkError && filteredVideos.length > 0 ? (
+        {feedError && filteredVideos.length > 0 ? (
           <div className={styles.feedToast} role="alert">
-            <span id="bookmark-error-status">{bookmarkError}</span>
+            <span id="feed-error-status">{feedError}</span>
             <button
               type="button"
-              aria-describedby="bookmark-error-status"
-              onClick={() => {
-                if (archive.bookmarkedVideosError) void loadBookmarkedVideos();
-                bookmarks.retry();
-              }}
+              aria-describedby="feed-error-status"
+              aria-label="Retry"
+              aria-busy={!bookmarkError && loadingMoreVideos}
+              disabled={!bookmarkError && loadingMoreVideos}
+              onClick={retryFeed}
             >
-              Retry
+              {!bookmarkError && loadingMoreVideos ? <LoaderCircle className={styles.spinning} size={16} aria-hidden="true" /> : "Retry"}
             </button>
           </div>
         ) : feedStatus ? <p className={styles.feedToast} role="status">{feedStatus}</p> : null}
@@ -1139,6 +1297,35 @@ export function MobileFeed({ creators, videos }: MobileFeedProps) {
       ) : null}
     </main>
   );
+}
+
+function FeedVideo({
+  videoId,
+  onVideoRef,
+  ...props
+}: Omit<ComponentProps<"video">, "ref"> & {
+  videoId: string;
+  onVideoRef: (id: string, node: HTMLVideoElement | null) => void;
+}) {
+  // A stable ref distinguishes actual removal from a parent's rerender, so
+  // retiring a player never clears a buffer that is still on screen.
+  const ref = useCallback((node: HTMLVideoElement | null) => onVideoRef(videoId, node), [onVideoRef, videoId]);
+  return <video {...props} ref={ref} />;
+}
+
+function hasPlaybackBuffer(video: HTMLVideoElement, seconds = PRELOAD_BUFFER_SECONDS): boolean {
+  if (!Number.isFinite(video.duration) || video.duration <= 0) return false;
+  const bufferedUntil = Math.min(video.duration, video.currentTime + seconds);
+  const buffered = video.buffered;
+  // WebKit's GStreamer backend can report no ranges after a complete download.
+  if (!buffered.length) {
+    return video.readyState === HTMLMediaElement.HAVE_ENOUGH_DATA
+      && video.networkState === HTMLMediaElement.NETWORK_IDLE;
+  }
+  for (let index = 0; index < buffered.length; index += 1) {
+    if (buffered.start(index) <= video.currentTime && buffered.end(index) >= bufferedUntil) return true;
+  }
+  return false;
 }
 
 function randomFeedSeed(): number {

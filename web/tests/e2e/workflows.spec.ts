@@ -224,7 +224,7 @@ test("cross-platform profile links can be created, renamed, unlinked, and restor
     name: "Unlink Instagram @alice_everywhere from Alice Linked",
   }).click();
   const unlinkedRow = manager.getByRole("listitem").filter({
-    has: manager.getByText("Instagram · @alice_everywhere"),
+    has: page.getByRole("link", { name: "Instagram · @alice_everywhere" }),
   });
   await expect(unlinkedRow).toBeVisible();
   await unlinkedRow.getByRole("combobox").selectOption({ label: "Alice Linked" });

@@ -115,6 +115,7 @@
 }
 
 .feedScroller {
+  position: relative;
   height: 100%;
   overflow-y: auto;
   overflow-anchor: none;
@@ -129,21 +130,22 @@
 
 .feedCard {
   --wash: var(--color-surface);
-  position: relative;
+  position: absolute;
+  left: 0;
+  width: 100%;
   height: 100%;
   min-height: 100%;
   overflow: hidden;
   background: var(--wash);
   isolation: isolate;
-  scroll-snap-align: start;
-  scroll-snap-stop: always;
 }
 
-.feedSpacer {
+.feedSnap {
   width: 1px;
-  min-height: 0;
+  height: 100%;
   pointer-events: none;
-  scroll-snap-align: none;
+  scroll-snap-align: start;
+  scroll-snap-stop: always;
 }
 
 .video,
@@ -168,7 +170,6 @@
   background: var(--wash);
   opacity: 1;
   pointer-events: none;
-  transition: opacity 120ms ease;
 }
 
 .videoPosterHidden {
@@ -614,8 +615,7 @@
 }
 
 .emptyActions button,
-.emptyActions a,
-.feedNotice button {
+.emptyActions a {
   display: inline-flex;
   min-height: var(--control-height);
   align-items: center;
@@ -632,32 +632,6 @@
 .emptyActions button:disabled {
   cursor: wait;
   opacity: 0.64;
-}
-
-.feedNotice {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  border: 1px solid color-mix(in srgb, var(--color-danger) 42%, var(--color-border));
-  border-radius: var(--radius-md);
-  padding: 8px 10px;
-  background: color-mix(in srgb, var(--color-danger) 9%, rgba(9, 11, 10, 0.94));
-  color: color-mix(in srgb, var(--color-danger) 48%, white);
-  font-size: 11px;
-  line-height: 1.4;
-}
-
-.feedNotice span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.feedNotice button {
-  min-height: var(--control-height);
-  flex: 0 0 auto;
-  padding: 0 11px;
 }
 
 @media (max-width: 390px) {

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { spawn as defaultSpawn } from 'node:child_process';
 import {
   chmod,
@@ -70,6 +71,76 @@ const PLATFORM_RULES = Object.freeze({
 
 const INSTAGRAM_LISTING_RANGE_MULTIPLIER = 5;
 
+// Login denial and throttling are account-wide; one inaccessible creator must not pause others.
+const PRIVATE_LISTING_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+const PRIVATE_LOGIN_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+let privateListingSkipUntilMs = 0;
+let privateListingRateLimitedUntilMs = 0;
+
+export function shouldSkipPrivateListings(now = Date.now()) {
+  return Number(now) < Math.max(privateListingSkipUntilMs, privateListingRateLimitedUntilMs);
+}
+
+export function recordPrivateListingOutcome(errorOrNull, now = Date.now()) {
+  if (!errorOrNull) {
+    return false;
+  }
+  if (errorOrNull.kind === 'rate_limited') {
+    privateListingRateLimitedUntilMs = Math.max(privateListingRateLimitedUntilMs, Number(now) + PRIVATE_LISTING_COOLDOWN_MS);
+    return true;
+  }
+  if (errorOrNull?.kind === 'access_denied' && (errorOrNull?.stage === 'login'
+    || /challenge|checkpoint|login|authentication|feedback_required/i.test(errorOrNull.message + ' ' + errorOrNull.stderr))) {
+    privateListingSkipUntilMs = Math.max(privateListingSkipUntilMs, Number(now) + PRIVATE_LOGIN_COOLDOWN_MS);
+    return true;
+  }
+  return false;
+}
+
+export function resetPrivateListingBreakerForTests() {
+  privateListingSkipUntilMs = 0;
+  privateListingRateLimitedUntilMs = 0;
+}
+
+function cooldownFile(options) {
+  const dataDir = options.dataDir ?? options.config?.dataDir;
+  return dataDir ? path.join(dataDir, 'instagram-account-cooldown.json') : null;
+}
+
+export async function assertInstagramAccountAvailable(options = {}) {
+  const file = cooldownFile(options);
+  if (file) {
+    try {
+      const state = JSON.parse(await readFile(file, 'utf8'));
+      privateListingSkipUntilMs = Math.max(privateListingSkipUntilMs, Number(state.loginUntil) || 0);
+      privateListingRateLimitedUntilMs = Math.max(privateListingRateLimitedUntilMs, Number(state.rateUntil) || 0);
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+  }
+  const retryAt = Math.max(privateListingSkipUntilMs, privateListingRateLimitedUntilMs);
+  if (Date.now() < retryAt) {
+    const login = privateListingSkipUntilMs > Date.now();
+    throw Object.assign(galleryDlError(login ? 'access_denied' : 'rate_limited',
+      login ? 'Instagram login or security restriction: account requests are paused for 24 hours. Resolve any prompts in Instagram before retrying.'
+        : 'Instagram is limiting requests. Account requests are paused for six hours.',
+      { retryable: true }), { retryAt, accountCooldown: true });
+  }
+}
+
+export async function recordInstagramAccountFailure(error, options = {}) {
+  if (error?.accountCooldown || !recordPrivateListingOutcome(error)) return;
+  const file = cooldownFile(options);
+  if (file) {
+    await mkdir(path.dirname(file), { recursive: true });
+    const temporary = file + '.' + randomUUID() + '.tmp';
+    await writeFile(temporary, JSON.stringify({
+      loginUntil: privateListingSkipUntilMs, rateUntil: privateListingRateLimitedUntilMs,
+    }), { mode: 0o600 });
+    await rename(temporary, file);
+  }
+}
+
 function normalizeInstagramHandle(input) {
   const raw = String(input ?? '').trim();
   if (!raw) throw galleryDlError('invalid_url', 'Instagram username is required.');
@@ -126,7 +197,7 @@ function buildListingCommonArgs(platform, settings, runtime, rangeEnd) {
     '--no-colors',
     '--quiet',
     '--retries',
-    '2',
+    platform === 'instagram' ? '0' : '2',
     '--http-timeout',
     String(Math.max(1, Math.min(60, Math.ceil(settings.timeoutMs / 1000)))),
     '--cache-file',
@@ -164,6 +235,8 @@ function resolveListingSettings(platform, options = {}) {
   if (!executable) throw galleryDlError('invalid_config', 'GALLERY_DL_PATH cannot be empty.');
   const proxy = normalizeProxy(values[rule.proxyOption], rule.proxyEnv);
   return {
+    platform,
+    accountOptions: values,
     executable,
     spawnImpl: values.spawnImpl ?? defaultSpawn,
     signal: values.signal ?? null,
@@ -181,9 +254,20 @@ function resolveListingSettings(platform, options = {}) {
 
 export async function listInstagramCreatorPosts(usernameOrUrl, options = {}) {
   const handle = normalizeInstagramHandle(usernameOrUrl);
-  try {
-    return await listPrivatePosts(handle, options);
-  } catch (privateError) {
+  await assertInstagramAccountAvailable(options);
+  let privateError = null;
+  if (!shouldSkipPrivateListings()) {
+    try {
+      const result = await listPrivatePosts(handle, options);
+      recordPrivateListingOutcome(null);
+      return result;
+    } catch (error) {
+      privateError = error;
+      await recordInstagramAccountFailure(error, options);
+    }
+  }
+  await assertInstagramAccountAvailable(options);
+  {
     const limit = Math.max(1, Math.min(50, Number(options.limit) || 5));
     const rangeEnd = Math.max(limit * INSTAGRAM_LISTING_RANGE_MULTIPLIER, limit + 2);
     const listingUrl = instagramPostsListingUrl(handle);
@@ -202,17 +286,30 @@ export async function listInstagramCreatorPosts(usernameOrUrl, options = {}) {
         return parseInstagramPostsListing(stdout, handle, listingUrl, limit);
       });
     } catch (galleryError) {
-      if (String(privateError?.kind ?? '') === 'not_found') throw privateError;
-      if (String(galleryError?.kind ?? '') === 'rate_limited' && String(privateError?.kind ?? '') !== 'rate_limited') throw privateError;
-      throw galleryError;
+      await recordInstagramAccountFailure(galleryError, options);
+      await assertInstagramAccountAvailable(options);
+      if (privateError && String(privateError?.kind ?? '') === 'not_found') throw privateError;
+      if (privateError && String(galleryError?.kind ?? '') === 'rate_limited' && String(privateError?.kind ?? '') !== 'rate_limited') throw privateError;
+      throw annotatePrivateListingFailure(galleryError, privateError);
     }
   }
 }
 export async function listInstagramCreatorStories(usernameOrUrl, options = {}) {
   const handle = normalizeInstagramHandle(usernameOrUrl);
-  try {
-    return await listPrivateStories(handle, options);
-  } catch (privateError) {
+  await assertInstagramAccountAvailable(options);
+  let privateError = null;
+  if (!shouldSkipPrivateListings()) {
+    try {
+      const result = await listPrivateStories(handle, options);
+      recordPrivateListingOutcome(null);
+      return result;
+    } catch (error) {
+      privateError = error;
+      await recordInstagramAccountFailure(error, options);
+    }
+  }
+  await assertInstagramAccountAvailable(options);
+  {
     const limit = Math.max(1, Math.min(50, Number(options.limit) || 5));
     const listingUrl = instagramStoriesListingUrl(handle);
     const settings = resolveListingSettings('instagram', options);
@@ -230,17 +327,30 @@ export async function listInstagramCreatorStories(usernameOrUrl, options = {}) {
         return parseInstagramStoriesListing(stdout, handle, listingUrl, limit);
       });
     } catch (galleryError) {
-      if (String(privateError?.kind ?? '') === 'not_found') throw privateError;
-      throw galleryError;
+      await recordInstagramAccountFailure(galleryError, options);
+      await assertInstagramAccountAvailable(options);
+      if (privateError && String(privateError?.kind ?? '') === 'not_found') throw privateError;
+      throw annotatePrivateListingFailure(galleryError, privateError);
     }
   }
 }
 
 export async function listInstagramCreatorHighlights(usernameOrUrl, options = {}) {
   const handle = normalizeInstagramHandle(usernameOrUrl);
-  try {
-    return await listPrivateHighlights(handle, options);
-  } catch (privateError) {
+  await assertInstagramAccountAvailable(options);
+  let privateError = null;
+  if (!shouldSkipPrivateListings()) {
+    try {
+      const result = await listPrivateHighlights(handle, options);
+      recordPrivateListingOutcome(null);
+      return result;
+    } catch (error) {
+      privateError = error;
+      await recordInstagramAccountFailure(error, options);
+    }
+  }
+  await assertInstagramAccountAvailable(options);
+  {
     const limit = Math.max(1, Math.min(50, Number(options.limit) || 20));
     const listingUrl = instagramHighlightsListingUrl(handle);
     const settings = resolveListingSettings('instagram', options);
@@ -258,11 +368,22 @@ export async function listInstagramCreatorHighlights(usernameOrUrl, options = {}
         return parseInstagramHighlightsListing(stdout, handle, listingUrl, limit);
       });
     } catch (galleryError) {
-      if (String(privateError?.kind ?? '') === 'not_found') throw privateError;
-      throw galleryError;
+      await recordInstagramAccountFailure(galleryError, options);
+      await assertInstagramAccountAvailable(options);
+      if (privateError && String(privateError?.kind ?? '') === 'not_found') throw privateError;
+      throw annotatePrivateListingFailure(galleryError, privateError);
     }
   }
 }
+
+function annotatePrivateListingFailure(galleryError, privateError) {
+  if (privateError) {
+    // Keep useful diagnostics without logging upstream URLs, headers, or response bodies.
+    galleryError.message += ` Private API: ${privateError.kind} (${privateError.stage || 'unknown stage'}).`;
+  }
+  return galleryError;
+}
+
 export function parseInstagramPostsListing(stdout, handle, sourceUrl, limit = 5) {
   let messages;
   try {
@@ -615,7 +736,15 @@ export function parseGalleryDlProbeOutput(stdout, referenceInput, options = {}) 
 async function probeWithRuntime(reference, settings, runtime) {
   const args = buildProbeArgs(reference, settings, runtime);
   const { stdout } = await runGalleryDl(settings.executable, args, settings);
-  return parseGalleryDlProbeOutput(stdout, reference, { maxAssets: settings.maxAssets });
+  try {
+    return parseGalleryDlProbeOutput(stdout, reference, { maxAssets: settings.maxAssets });
+  } catch (error) {
+    if (reference.platform === 'instagram') {
+      await recordInstagramAccountFailure(error, settings.accountOptions);
+      await assertInstagramAccountAvailable(settings.accountOptions);
+    }
+    throw error;
+  }
 }
 
 async function withRuntime(reference, settings, callback) {
@@ -664,7 +793,7 @@ function buildCommonArgs(reference, settings, runtime, rangeEnd) {
     '--no-colors',
     '--quiet',
     '--retries',
-    '2',
+    reference.platform === 'instagram' ? '0' : '2',
     '--http-timeout',
     String(Math.max(1, Math.min(60, Math.ceil(settings.timeoutMs / 1000)))),
     '--cache-file',
@@ -689,6 +818,8 @@ function resolveSettings(reference, options) {
   if (!executable) throw galleryDlError('invalid_config', 'GALLERY_DL_PATH cannot be empty.');
   const proxy = normalizeProxy(values[rule.proxyOption], rule.proxyEnv);
   return {
+    platform: reference.platform,
+    accountOptions: values,
     executable,
     spawnImpl: values.spawnImpl ?? defaultSpawn,
     signal: values.signal ?? null,
@@ -779,6 +910,20 @@ function filterNetscapeCookies(source, allowedDomains) {
 }
 
 async function runGalleryDl(executable, args, options) {
+  const instagram = options.platform === 'instagram';
+  if (instagram) await assertInstagramAccountAvailable(options.accountOptions);
+  try {
+    return await runGalleryDlProcess(executable, args, options);
+  } catch (error) {
+    if (instagram) {
+      await recordInstagramAccountFailure(error, options.accountOptions);
+      await assertInstagramAccountAvailable(options.accountOptions);
+    }
+    throw error;
+  }
+}
+
+async function runGalleryDlProcess(executable, args, options) {
   if (options.signal?.aborted) {
     throw galleryDlError('aborted', 'gallery-dl was aborted.');
   }

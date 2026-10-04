@@ -1,6 +1,6 @@
 import { spawn as defaultSpawn } from 'node:child_process';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { mkdir, mkdtemp, readdir, rename, rm, stat, writeFile, copyFile, chmod } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile, copyFile, chmod } from 'node:fs/promises';
 import { once } from 'node:events';
 import { Readable } from 'node:stream';
 import os from 'node:os';
@@ -31,7 +31,7 @@ const DISCORD_COMPATIBLE_FORMAT = [
   'bv*[vcodec^=avc]+ba',
   'b[vcodec^=avc]',
   'bv*+ba',
-  'b',
+  'b[vcodec!=?none]',
 ].join('/');
 
 const DOWNLOAD_BASE_ARGS = [
@@ -110,7 +110,12 @@ export function buildDownloadArgs(sourceUrl, options = {}) {
   const maxBytes = normalizePositiveInt(options.maxMediaDownloadBytes);
   if (maxBytes) args.push('--max-filesize', String(maxBytes));
   if (Array.isArray(options.extraArgs)) args.push(...options.extraArgs.map(String));
-  args.push('--', String(sourceUrl));
+  if (options.infoJsonFile) {
+    // Raise download errors so yt-dlp's info-file loader can refresh expired URLs.
+    args.push('--abort-on-error', '--load-info-json', String(options.infoJsonFile));
+  } else {
+    args.push('--', String(sourceUrl));
+  }
   return args;
 }
 
@@ -139,8 +144,12 @@ export async function listProfileVideos(usernameOrUrl, options = {}) {
     flatPlaylist: true,
   });
 
+  const username = resolvePlaylistUsername(
+    raw.uploader, raw.channel, raw.creator, raw.username,
+    options.username, options.watch?.username, extractUsernameFromUrl(usernameOrUrl), usernameOrUrl,
+  );
   const entries = Array.isArray(raw.entries)
-    ? raw.entries.map((entry, index) => normalizePlaylistEntry(entry, sourceUrl, index))
+    ? raw.entries.map((entry, index) => normalizePlaylistEntry(entry, sourceUrl, index, { username }))
     : [];
   const metadata = normalizeMetadata(raw, sourceUrl);
   if (cachedSecUid && !metadata.secUid) metadata.secUid = cachedSecUid;
@@ -197,7 +206,7 @@ export async function listProfileStories(usernameOrUrl, options = {}) {
     ? raw.itemList.map((entry, index) => normalizeStoryEntry(entry, {
         ...profile,
         sourceUrl: storySourceUrl,
-      }, index)).filter((entry) => entry.videoId && entry.directVideoUrl)
+      }, index)).filter((entry) => entry.videoId && (entry.directVideoUrl || entry.imageUrls.length))
     : [];
   const hasStory = entries.length > 0;
 
@@ -247,16 +256,17 @@ export async function downloadVideo(sourceUrl, options = {}) {
     let stdout = '';
     let stderr = '';
     try {
-      const result = await runYtDlp(ytdlpPath, buildDownloadArgs(sourceUrl, {
+      const result = await runVideoDownload(ytdlpPath, sourceUrl, metadata, {
         ...options,
         outputDir: tempDir,
-      }), options);
+      });
       stdout = result.stdout;
       stderr = result.stderr;
     } catch (error) {
       if (!shouldTryPhotoFallback(sourceUrl, error, options)) throw error;
       const slideshowDir = await prepareSlideshowWorkDir(workDir);
-      return await downloadPhotoPost(sourceUrl, await fetchPhotoPostMetadata(sourceUrl, options), slideshowDir, options);
+      const photoMetadata = mergeDownloadedMetadata(metadata, await fetchPhotoPostMetadata(sourceUrl, options));
+      return await downloadPhotoPost(sourceUrl, photoMetadata, slideshowDir, options);
     }
 
     let downloadDir = tempDir;
@@ -271,7 +281,6 @@ export async function downloadVideo(sourceUrl, options = {}) {
       });
     }
 
-    const normalized = normalizeMetadata(metadata, sourceUrl);
     if (!pickPrimaryVideo(files)) {
       const noVideoError = Object.assign(new Error('yt-dlp completed without producing a playable video file.'), {
         kind: 'no_video_file',
@@ -291,13 +300,14 @@ export async function downloadVideo(sourceUrl, options = {}) {
         }
         if (photoMetadata) {
           const slideshowDir = await prepareSlideshowWorkDir(workDir);
-          return downloadPhotoPost(sourceUrl, photoMetadata, slideshowDir, options);
+          return downloadPhotoPost(sourceUrl, mergeDownloadedMetadata(metadata, photoMetadata), slideshowDir, options);
         }
       }
 
       throw noVideoError;
     }
 
+    const normalized = normalizeMetadata(await readDownloadedMetadata(files, metadata), sourceUrl);
     if (options.downloadDir) {
       const layout = makeDownloadLayout({ downloadDir: options.downloadDir }, normalized);
       downloadDir = layout.dir;
@@ -323,6 +333,7 @@ export async function downloadVideo(sourceUrl, options = {}) {
       thumbnailUrl: normalized.thumbnail || '',
       mediaType: normalized.mediaType || '',
       duration: numberOrNull(normalized.duration) ?? 0,
+      timestamp: numberOrNull(normalized.timestamp),
       stdout,
       stderr,
     };
@@ -501,6 +512,60 @@ export function classifyYtdlpError(error, options = {}) {
   return makeClassification('yt_dlp_error', 'yt-dlp failed.', false, exitCode, signal, stdout, stderr);
 }
 
+async function runVideoDownload(executable, sourceUrl, metadata, options) {
+  let infoDir = '';
+  try {
+    let infoJsonFile = '';
+    if (
+      metadata?.id
+      && (!metadata._type || metadata._type === 'video')
+      && Array.isArray(metadata.formats)
+      && metadata.formats.length > 0
+      && metadata.formats.every((format) => typeof format?.url === 'string' && format.url.length > 0)
+    ) {
+      infoDir = await mkdtemp(path.join(os.tmpdir(), 'tiktok-download-info-'));
+      infoJsonFile = path.join(infoDir, 'input.json');
+      await writeFile(infoJsonFile, JSON.stringify({ ...metadata, webpage_url: sourceUrl }), { mode: 0o600 });
+    }
+    return await runYtDlp(executable, buildDownloadArgs(sourceUrl, { ...options, infoJsonFile }), options);
+  } finally {
+    if (infoDir) await rm(infoDir, { recursive: true, force: true });
+  }
+}
+
+async function readDownloadedMetadata(files, metadata) {
+  const sidecar = files.find((file) => path.basename(file) === `${metadata.id}.info.json`);
+  if (!sidecar) {
+    if (typeof metadata.title === 'string') return metadata;
+    throw Object.assign(new Error('yt-dlp did not write metadata for the downloaded video.'), {
+      kind: 'missing_download_metadata',
+    });
+  }
+  let extracted;
+  try {
+    extracted = JSON.parse(await readFile(sidecar, 'utf8'));
+  } catch (cause) {
+    throw Object.assign(new Error('yt-dlp wrote invalid metadata for the downloaded video.'), {
+      kind: 'invalid_download_metadata', cause,
+    });
+  }
+  if (String(extracted?.id) !== String(metadata.id) || typeof extracted?.title !== 'string') {
+    throw Object.assign(new Error('yt-dlp metadata does not match the downloaded post.'), {
+      kind: 'invalid_download_metadata',
+    });
+  }
+  return mergeDownloadedMetadata(metadata, extracted);
+}
+
+function mergeDownloadedMetadata(metadata, extracted) {
+  return {
+    ...metadata,
+    ...extracted,
+    ...(metadata.uploader ? { uploader: metadata.uploader } : {}),
+    ...(metadata.username ? { username: metadata.username } : {}),
+  };
+}
+
 async function runYtDlp(executable, args, options = {}) {
   await loadTikTokCookieSession(options);
   const cookiesStaging = await stageCookiesCopy(options);
@@ -626,7 +691,13 @@ function normalizePlaylistEntry(entry, sourceUrl, index, defaults = {}) {
   const raw = entry && typeof entry === 'object' ? entry : {};
   const mediaType = resolveMediaType({ ...defaults, ...raw }, raw.webpage_url ?? raw.original_url ?? raw.url ?? sourceUrl);
   const videoId = String(raw.id ?? extractIdFromEntryUrl(raw.url) ?? '');
-  const videoUrl = resolvePlaylistEntryUrl(raw, sourceUrl, mediaType, videoId);
+  const username = resolvePlaylistUsername(
+    raw.uploader, raw.channel, raw.creator, raw.username,
+    extractUsernameFromUrl(raw.uploader_url),
+    ...[raw.webpage_url, raw.original_url, raw.url].filter(isTikTokUrl).map(extractUsernameFromUrl),
+    defaults.username, extractUsernameFromUrl(sourceUrl),
+  );
+  const videoUrl = resolvePlaylistEntryUrl(raw, sourceUrl, mediaType, videoId, username);
   return {
     ...raw,
     id: videoId,
@@ -637,30 +708,33 @@ function normalizePlaylistEntry(entry, sourceUrl, index, defaults = {}) {
     videoUrl,
     videoId,
     title: String(raw.title ?? ''),
-    uploader: String(raw.uploader ?? raw.channel ?? raw.creator ?? ''),
+    uploader: String(raw.uploader ?? raw.channel ?? raw.creator ?? username),
     mediaType,
   };
 }
 
-function resolvePlaylistEntryUrl(entry = {}, sourceUrl = '', mediaType = '', videoId = '') {
+function resolvePlaylistUsername(...values) {
+  return values.map((value) => String(value ?? '').trim().replace(/^@/, ''))
+    .find((value) => /^[A-Za-z0-9._]{1,24}$/.test(value)
+      && !value.startsWith('.') && !value.endsWith('.') && !value.includes('..')) ?? '';
+}
+
+function resolvePlaylistEntryUrl(entry = {}, sourceUrl = '', mediaType = '', videoId = '', knownUsername = '') {
+  const username = resolvePlaylistUsername(
+    entry.uploader, entry.channel, entry.creator, entry.username,
+    extractUsernameFromUrl(entry.uploader_url), knownUsername, extractUsernameFromUrl(sourceUrl),
+  );
+  if (username && /^\d+$/.test(videoId)) {
+    const kind = mediaType === 'story' ? 'story' : mediaType === 'slideshow' ? 'photo' : 'video';
+    return `https://www.tiktok.com/@${username}/${kind}/${videoId}`;
+  }
+
   for (const value of [entry.webpage_url, entry.original_url, entry.url]) {
     const text = String(value ?? '');
     if (/^https?:\/\//i.test(text)) return text;
   }
 
-  const username = String(
-    entry.uploader
-      ?? entry.channel
-      ?? entry.creator
-      ?? extractUsernameFromUrl(sourceUrl)
-      ?? '',
-  );
-  if (username && videoId) {
-    const kind = mediaType === 'story' ? 'story' : 'video';
-    return `https://www.tiktok.com/@${username}/${kind}/${videoId}`;
-  }
-
-  return String(sourceUrl ?? '');
+  return /^https?:\/\//i.test(sourceUrl) ? String(sourceUrl) : '';
 }
 
 function extractUsernameFromUrl(sourceUrl = '') {
@@ -822,7 +896,6 @@ function normalizeStoryEntry(item, profile = {}, index = 0) {
   const video = raw.video && typeof raw.video === 'object' ? raw.video : {};
   const id = String(raw.id ?? video.id ?? video.videoID ?? '');
   const username = String(raw.author?.uniqueId ?? profile.username ?? '');
-  const storyPageUrl = username && id ? `https://www.tiktok.com/@${username}/story/${id}` : String(profile.sourceUrl ?? '');
   const directVideoUrl = firstString(
     video.playAddr,
     video.downloadAddr,
@@ -830,14 +903,26 @@ function normalizeStoryEntry(item, profile = {}, index = 0) {
     video.PlayAddrStruct?.urlList,
     video.bitRateInfo?.map((entry) => entry?.PlayAddr?.UrlList ?? entry?.PlayAddr?.urlList),
   );
+  const images = raw.imagePost?.images ?? raw.image_post_info?.images;
+  const imageUrls = Array.isArray(images)
+    ? images.map((image) => firstString(
+        image?.imageURL?.urlList,
+        image?.image_url?.url_list,
+        image?.display_image?.url_list,
+        image?.downloadURL?.urlList,
+        image?.download_url?.url_list,
+      )).filter(Boolean)
+    : [];
+  const kind = !directVideoUrl && imageUrls.length ? 'photo' : 'story';
+  const pageUrl = username && id ? `https://www.tiktok.com/@${username}/${kind}/${id}` : String(profile.sourceUrl ?? '');
   const dataSize = numberOrNull(video.PlayAddrStruct?.DataSize ?? video.size ?? video.dataSize) ?? 0;
   return {
     id,
     position: index + 1,
     sourceUrl: String(profile.sourceUrl ?? storyPageUrl),
-    url: storyPageUrl,
-    webpage_url: storyPageUrl,
-    videoUrl: storyPageUrl,
+    url: pageUrl,
+    webpage_url: pageUrl,
+    videoUrl: pageUrl,
     videoId: id,
     title: String(raw.desc || (id ? `Story ${id}` : 'Story')),
     description: String(raw.desc ?? ''),
@@ -845,9 +930,11 @@ function normalizeStoryEntry(item, profile = {}, index = 0) {
     username,
     mediaType: 'story',
     directVideoUrl,
+    imageUrls,
+    imageCount: imageUrls.length,
     timestamp: numberOrNull(raw.createTime) ?? 0,
     duration: numberOrNull(video.duration) ?? 0,
-    thumbnail: firstString(video.cover, video.dynamicCover, video.originCover) || '',
+    thumbnail: firstString(video.cover, video.dynamicCover, video.originCover) || imageUrls[0] || '',
     filesizeApprox: dataSize,
     storyExpiresAt: numberOrNull(raw.story?.ExpiredAt ?? raw.story?.expiredAt) ?? 0,
   };
@@ -997,10 +1084,11 @@ async function downloadPhotoPost(sourceUrl, metadata, tempDir, options = {}) {
     title: normalized.title || '',
     description: normalized.description || '',
     thumbnailUrl: normalized.thumbnail || '',
-    mediaType: 'slideshow',
+    mediaType: normalized.mediaType === 'story' ? 'story' : 'slideshow',
     imageCount: imageEntries.length,
     slideshowImagePaths,
-    duration: 0,
+    duration: numberOrNull(normalized.duration) ?? 0,
+    timestamp: numberOrNull(normalized.timestamp),
     stdout: '',
     stderr: '',
   };
@@ -1087,6 +1175,7 @@ async function downloadStoryPost(sourceUrl, metadata, tempDir, options = {}) {
     thumbnailUrl: normalized.thumbnail || '',
     mediaType: 'story',
     duration: numberOrNull(normalized.duration) ?? 0,
+    timestamp: numberOrNull(normalized.timestamp),
     stdout: '',
     stderr: '',
   };
@@ -1253,7 +1342,7 @@ function shouldTryPhotoFallback(sourceUrl, error, options = {}) {
 }
 
 function isPhotoPostMetadata(metadata) {
-  return metadata?.mediaType === 'slideshow'
+  return (metadata?.mediaType === 'slideshow' || (metadata?.mediaType === 'story' && !isStoryMetadata(metadata)))
     && Array.isArray(metadata?.imageUrls)
     && metadata.imageUrls.length > 0;
 }
