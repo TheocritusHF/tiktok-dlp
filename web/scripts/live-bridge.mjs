@@ -63,6 +63,10 @@ let cacheEvictionPromise = null;
 
 await mkdir(cacheDir, { recursive: true });
 await pruneLiveCache();
+const cacheCleanupTimer = setInterval(() => {
+  void pruneLiveCache().catch((error) => console.error(`[rewind] Cache cleanup failed: ${error.message}`));
+}, 60 * 60_000);
+cacheCleanupTimer.unref?.();
 
 const server = http.createServer(async (request, response) => {
   const origin = request.headers.origin || "";
@@ -295,6 +299,7 @@ const server = http.createServer(async (request, response) => {
         videoRowsById.clear();
         postRowsById.clear();
         loadMetadataIndex.invalidate();
+        if (request.method === "DELETE") await purgePlaybackCopies();
       }
       sendUpstream(response, upstream);
       return;
@@ -337,6 +342,7 @@ const server = http.createServer(async (request, response) => {
         videoRowsById.clear();
         postRowsById.clear();
         loadMetadataIndex.invalidate();
+        await purgePlaybackCopies();
       }
       sendUpstream(response, upstream);
       return;
@@ -351,6 +357,7 @@ const server = http.createServer(async (request, response) => {
         videoRowsById.clear();
         postRowsById.clear();
         loadMetadataIndex.invalidate();
+        await purgePlaybackCopies();
       }
       sendUpstream(response, upstream);
       return;
@@ -390,6 +397,7 @@ const server = http.createServer(async (request, response) => {
         videoRowsById.clear();
         postRowsById.clear();
         loadMetadataIndex.invalidate();
+        await purgePlaybackCopies();
       }
       response.writeHead(upstream.status, {
         "Cache-Control": "no-store",
@@ -409,6 +417,7 @@ const server = http.createServer(async (request, response) => {
         videoRowsById.clear();
         postRowsById.clear();
         loadMetadataIndex.invalidate();
+        await purgePlaybackCopies();
       }
       response.writeHead(upstream.status, {
         "Cache-Control": "no-store",
@@ -1056,6 +1065,25 @@ async function generateLocalThumbnail(record, localPath) {
 function markActiveCacheFile(filePath) {
   if (path.dirname(path.resolve(filePath)) !== path.resolve(cacheDir)) return () => {};
   return activeCacheFiles.acquire(path.basename(filePath));
+}
+
+async function purgePlaybackCopies() {
+  const pending = [...inflightPlayback.values()].map((entry) => entry.promise);
+  await purgeCompletedPlaybackCopies();
+  if (pending.length) {
+    void Promise.allSettled(pending).then(() => purgeCompletedPlaybackCopies());
+  }
+}
+
+async function purgeCompletedPlaybackCopies() {
+  try {
+    const entries = await readdir(cacheDir, { withFileTypes: true });
+    await Promise.all(entries
+      .filter((entry) => entry.isFile() && /^playback-v\d+-[a-f0-9]{32}\.mp4$/.test(entry.name))
+      .map((entry) => rm(path.join(cacheDir, entry.name), { force: true })));
+  } catch (error) {
+    console.error(`[rewind] Could not clear playback cache after archive deletion: ${error.message}`);
+  }
 }
 
 function pruneLiveCache() {

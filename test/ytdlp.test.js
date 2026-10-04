@@ -1126,7 +1126,8 @@ test('configured cookies are required to exist and are sent on photo/story HTTP 
   });
   assert.equal(stories.count, 1);
   assert.ok(storyFetch.calls.length >= 2);
-  assert.ok(storyFetch.calls.every((call) => headerValue(call.init.headers, 'cookie').includes('sessionid=test-session')));
+  assert.ok(storyFetch.calls.filter((call) => new URL(String(call.url)).hostname.endsWith('tiktok.com'))
+    .every((call) => headerValue(call.init.headers, 'cookie').includes('sessionid=test-session')));
   assert.ok(storyFetch.calls.every((call) => call.init.dispatcher));
 
   const storyRoot = await mkdtemp(path.join(os.tmpdir(), 'tiktok-story-cookie-downloads-'));
@@ -1138,7 +1139,7 @@ test('configured cookies are required to exist and are sent on photo/story HTTP 
   });
   const cdnCall = storyFetch.calls.find((call) => String(call.url).includes('cdn.example.test/story.mp4'));
   assert.ok(cdnCall);
-  assert.match(headerValue(cdnCall.init.headers, 'cookie'), /sessionid=test-session/);
+  assert.equal(headerValue(cdnCall.init.headers, 'cookie'), '');
 
   const imageCalls = [];
   const photoRoot = await mkdtemp(path.join(os.tmpdir(), 'tiktok-photo-cookie-downloads-'));
@@ -1155,7 +1156,7 @@ test('configured cookies are required to exist and are sent on photo/story HTTP 
     ytdlpCookiesFile: cookiesFile,
   });
   assert.ok(imageCalls.some((call) => /\.jpe?g/.test(String(call.url))));
-  assert.ok(imageCalls.every((call) => headerValue(call.init.headers, 'cookie').includes('sessionid=test-session')));
+  assert.ok(imageCalls.every((call) => headerValue(call.init.headers, 'cookie') === ''));
 });
 
 test('yt-dlp gets --impersonate chrome and a writable cookies copy, not the mounted source file', async () => {

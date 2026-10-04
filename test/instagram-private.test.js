@@ -15,6 +15,39 @@ import {
 
 const INSTAGRAM_THROTTLE_MESSAGE = 'feedback_required: We limit how often you can do certain things on Instagram to protect our community.';
 
+test('Instagram device file strips legacy and newly returned session credentials', async t => {
+  if (spawnSync('python3', ['--version']).error?.code === 'ENOENT') {
+    t.skip('python3 is not available');
+    return;
+  }
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ig-device-privacy-'));
+  const deviceFile = path.join(dir, 'device.json');
+  const script = new URL('../scripts/instagram-private-list.py', import.meta.url).pathname;
+  try {
+    const result = spawnSync('python3', ['-c', `
+import json, runpy, sys
+helper = runpy.run_path(sys.argv[1])
+device_file = sys.argv[2]
+settings = {
+    "uuids": {"uuid": "stable-device"},
+    "device_settings": {"model": "Pixel 6"},
+    "cookies": {"sessionid": "synthetic-secret"},
+    "authorization_data": {"sessionid": "synthetic-secret"},
+}
+with open(device_file, "w") as file:
+    json.dump(settings, file)
+loaded = helper["ensure_device_settings"](device_file)
+assert set(loaded) == {"uuids", "device_settings"}
+assert json.load(open(device_file)) == loaded
+helper["save_device_settings"](device_file, settings)
+assert json.load(open(device_file)) == loaded
+`, script, deviceFile], { encoding: 'utf8', timeout: 10000, env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' } });
+    assert.equal(result.status, 0, result.stderr);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('private listings only reuse a matching profile resolved during this poll', async () => {
   const resolvedProfile = { platform: 'instagram', username: 'Creator', creatorId: '123' };
   for (const list of [listPrivatePosts, listPrivateStories, listPrivateHighlights]) {

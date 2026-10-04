@@ -520,6 +520,8 @@ test("live bridge paginates active videos and serves an existing .image sidecar"
     method: "PUT",
   });
   assert.equal(wrongMediaPostMethod.status, 405);
+  const preparedCopy = path.join(fixture, "cache", `playback-v2-${"a".repeat(32)}.mp4`);
+  await writeFile(preparedCopy, "cached playback copy");
   const trashedPost = await fetch(`http://127.0.0.1:${port}/api/media-posts/6`, {
     method: "DELETE",
     headers: { "content-type": "application/json" },
@@ -527,6 +529,7 @@ test("live bridge paginates active videos and serves an existing .image sidecar"
   });
   assert.equal(trashedPost.status, 200);
   assert.equal((await trashedPost.json()).trashedPost, true);
+  assert.equal((await readdir(path.dirname(preparedCopy))).includes(path.basename(preparedCopy)), false);
   assert.deepEqual((await (await fetch(`http://127.0.0.1:${port}/api/posts?platform=instagram`)).json()).items, []);
   const trashedPosts = await (await fetch(
     `http://127.0.0.1:${port}/api/posts?platform=instagram&trashed=1`,
