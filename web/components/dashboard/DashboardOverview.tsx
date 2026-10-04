@@ -15,7 +15,7 @@ export function DashboardOverview({
   fallbackVideos: SavedVideo[];
   fallbackStats: ArchiveStats;
 }) {
-  const archive = useArchiveData({ fallbackCreators, fallbackVideos, fallbackStats });
+  const archive = useArchiveData({ fallbackCreators, fallbackVideos, fallbackStats, videoLimit: 5 });
   const { creators, videos, stats } = archive;
   const loading = archive.source === "loading" || archive.source === "refreshing";
   const activeCreators = creators.filter((creator) => creator.enabled).length;

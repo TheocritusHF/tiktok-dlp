@@ -73,12 +73,15 @@ jobs:
       - name: Run lint
         run: npm run lint
 
+      - name: Install playback conversion tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+
       - name: Run unit, integration, and production-build tests
         run: npm test
 
   browser:
     name: Rewind Chromium workflows
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: web
     timeout-minutes: 20
     defaults:
@@ -98,6 +101,9 @@ jobs:
 
       - name: Install Chromium
         run: npx playwright install --with-deps chromium
+
+      - name: Install video fixture encoder
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
 
       - name: Run desktop and mobile browser workflows
         run: npx playwright test --project=desktop-chromium --project=mobile-chromium

@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { bookmarkedVideoPageParams, boundedVideoPageLimit, mergeVideoPage } from "./archive-data-state.mjs";
+import { fetchJson } from "./json-request.mjs";
 import type { ArchiveStats, Creator, FeedPage, SavedVideo } from "./types";
 
 export type ArchiveDataSource = "mock" | "loading" | "refreshing" | "live" | "error";
@@ -44,16 +45,20 @@ export function useArchiveData({
   const [videos, setVideos] = useState(liveMode ? [] : fallbackVideos);
   const [bookmarkedVideos, setBookmarkedVideos] = useState(liveMode ? [] : fallbackVideos);
   const [stats, setStats] = useState(liveMode ? emptyStats : fallbackStats);
-  const [source, setSource] = useState<ArchiveDataSource>(configuredBase ? "loading" : "mock");
-  const [error, setError] = useState("");
-  const [revision, setRevision] = useState(0);
+  const [metadataSource, setMetadataSource] = useState<ArchiveDataSource>(liveMode ? "loading" : "mock");
+  const [videoSource, setVideoSource] = useState<ArchiveDataSource>(liveMode ? "loading" : "mock");
+  const [metadataError, setMetadataError] = useState("");
+  const [videoError, setVideoError] = useState("");
+  const [metadataRevision, setMetadataRevision] = useState(0);
+  const [videoRevision, setVideoRevision] = useState(0);
   const [nextVideoCursor, setNextVideoCursor] = useState<string | null>(null);
   const [nextBookmarkCursor, setNextBookmarkCursor] = useState<string | null>(null);
   const [bookmarkedVideosError, setBookmarkedVideosError] = useState("");
   const [bookmarkedVideosLoaded, setBookmarkedVideosLoaded] = useState(!liveMode);
   const [loadingMoreVideos, setLoadingMoreVideos] = useState(false);
   const [loadingBookmarkedVideos, setLoadingBookmarkedVideos] = useState(false);
-  const hasLoadedLiveData = useRef(false);
+  const hasLoadedMetadata = useRef(false);
+  const hasLoadedVideos = useRef(false);
   const nextVideoCursorRef = useRef<string | null>(null);
   const nextBookmarkCursorRef = useRef<string | null>(null);
   const loadingMoreVideosRef = useRef(false);
@@ -61,9 +66,13 @@ export function useArchiveData({
   const loadMoreRetryAfterRef = useRef(0);
   const videoRequestKeyRef = useRef("");
   const videoGenerationRef = useRef(0);
+  const videoRequestControllerRef = useRef<AbortController | null>(null);
   const bookmarkGenerationRef = useRef(0);
   const bookmarkRequestControllerRef = useRef<AbortController | null>(null);
-  const refresh = useCallback(() => setRevision((current) => current + 1), []);
+  const refresh = useCallback(() => {
+    setMetadataRevision((current) => current + 1);
+    setVideoRevision((current) => current + 1);
+  }, []);
   const base = configuredBase?.replace(/\/+$/, "") || "";
   const videoPageLimit = boundedVideoPageLimit(videoLimit, paginateVideos);
   const bookmarkScopeKey = `${videoCreatorId}\0${videoUsername}`;
@@ -79,74 +88,88 @@ export function useArchiveData({
   }, [paginateVideos, videoCreatorId, videoFileId, videoPageLimit, videoUsername]);
 
   const fetchVideoPage = useCallback(async (cursor = "", signal?: AbortSignal) => {
-    const payload = await fetch(`${base}/api/videos?${makeVideoParams(cursor)}`, {
+    const payload = await fetchJson<SavedVideo[] | FeedPage>(`${base}/api/videos?${makeVideoParams(cursor)}`, {
       cache: "no-store",
       signal,
-    }).then(assertJsonResponse<SavedVideo[] | FeedPage>);
+    });
     return normalizeVideoPage(payload);
   }, [base, makeVideoParams]);
 
   useEffect(() => {
     if (!configuredBase) return;
-
     const controller = new AbortController();
+    setMetadataSource(hasLoadedMetadata.current ? "refreshing" : "loading");
+    setMetadataError("");
+    Promise.allSettled([
+      fetchJson<Creator[]>(`${base}/api/creators`, {
+        cache: "no-store",
+        signal: controller.signal,
+      }).then((items) => {
+        if (!controller.signal.aborted) setCreators(items);
+      }),
+      includeStats
+        ? fetchJson<ArchiveStats>(`${base}/api/stats`, {
+          cache: "no-store",
+          signal: controller.signal,
+        }).then((totals) => {
+          if (!controller.signal.aborted) setStats(totals);
+        })
+        : Promise.resolve(),
+    ])
+      .then(([creatorResult, statsResult]) => {
+        if (controller.signal.aborted) return;
+        const failures: string[] = [];
+        if (creatorResult.status === "rejected") failures.push(errorMessage("creators", creatorResult.reason));
+        if (statsResult.status === "rejected") failures.push(errorMessage("archive totals", statsResult.reason));
+        if (creatorResult.status === "fulfilled" || (includeStats && statsResult.status === "fulfilled")) {
+          hasLoadedMetadata.current = true;
+        }
+        setMetadataSource(hasLoadedMetadata.current ? "live" : "error");
+        setMetadataError(failures.join(" "));
+      });
+    return () => controller.abort();
+  }, [base, configuredBase, includeStats, metadataRevision]);
+
+  useEffect(() => {
+    if (!configuredBase) return;
+    const controller = new AbortController();
+    videoRequestControllerRef.current?.abort();
+    videoRequestControllerRef.current = controller;
     videoGenerationRef.current += 1;
+    loadingMoreVideosRef.current = false;
     loadMoreRetryAfterRef.current = 0;
-    setSource(hasLoadedLiveData.current ? "refreshing" : "loading");
-    setError("");
+    // Reset pagination when its request scope changes.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setLoadingMoreVideos(false);
+    setVideoSource(hasLoadedVideos.current ? "refreshing" : "loading");
+    setVideoError("");
+    nextVideoCursorRef.current = null;
+    setNextVideoCursor(null);
     const videoRequestKey = `${videoCreatorId}\0${videoUsername}\0${videoFileId}\0${videoPageLimit}\0${paginateVideos}`;
     if (videoRequestKeyRef.current !== videoRequestKey) {
       videoRequestKeyRef.current = videoRequestKey;
-      nextVideoCursorRef.current = null;
-      setNextVideoCursor(null);
       if (paginateVideos) setVideos([]);
     }
-
-    Promise.allSettled([
-      fetch(`${base}/api/creators`, {
-        cache: "no-store",
-        signal: controller.signal,
-      }).then(assertJsonResponse<Creator[]>),
-      includeVideos
-        ? fetchVideoPage("", controller.signal)
-        : Promise.resolve({ items: [] as SavedVideo[], nextCursor: null }),
-      includeStats
-        ? fetch(`${base}/api/stats`, {
-          cache: "no-store",
-          signal: controller.signal,
-        }).then(assertJsonResponse<ArchiveStats>)
-        : Promise.resolve(emptyStats),
-    ])
-      .then(([creatorResult, videoResult, statsResult]) => {
-        if (controller.signal.aborted) return;
-        const failures: string[] = [];
-
-        if (creatorResult.status === "fulfilled") setCreators(creatorResult.value);
-        else failures.push(errorMessage("creators", creatorResult.reason));
-        if (videoResult.status === "fulfilled") {
-          setVideos(videoResult.value.items);
-          nextVideoCursorRef.current = videoResult.value.nextCursor;
-          setNextVideoCursor(videoResult.value.nextCursor);
-        }
-        else failures.push(errorMessage("videos", videoResult.reason));
-        if (statsResult.status === "fulfilled") setStats(statsResult.value);
-        else failures.push(errorMessage("archive totals", statsResult.reason));
-
-        const receivedLiveData = creatorResult.status === "fulfilled"
-          || (includeVideos && videoResult.status === "fulfilled")
-          || (includeStats && statsResult.status === "fulfilled");
-        if (receivedLiveData) hasLoadedLiveData.current = true;
-        setSource(hasLoadedLiveData.current ? "live" : "error");
-        setError(failures.join(" "));
-      })
-      .catch((nextError: unknown) => {
-        if (controller.signal.aborted) return;
-        setSource(hasLoadedLiveData.current ? "live" : "error");
-        setError(nextError instanceof Error ? nextError.message : String(nextError));
-      });
-
-    return () => controller.abort();
-  }, [base, configuredBase, fetchVideoPage, includeStats, includeVideos, paginateVideos, revision, videoCreatorId, videoFileId, videoPageLimit, videoUsername]);
+    const request = includeVideos
+      ? fetchVideoPage("", controller.signal)
+      : Promise.resolve({ items: [] as SavedVideo[], nextCursor: null });
+    request.then((page) => {
+      if (controller.signal.aborted) return;
+      setVideos(page.items);
+      nextVideoCursorRef.current = page.nextCursor;
+      setNextVideoCursor(page.nextCursor);
+      hasLoadedVideos.current = includeVideos;
+      setVideoSource(includeVideos ? "live" : "mock");
+    }).catch((nextError: unknown) => {
+      if (controller.signal.aborted) return;
+      setVideoSource(hasLoadedVideos.current ? "live" : "error");
+      setVideoError(errorMessage("videos", nextError));
+    });
+    return () => {
+      controller.abort();
+      videoRequestControllerRef.current?.abort();
+    };
+  }, [configuredBase, fetchVideoPage, includeVideos, paginateVideos, videoRevision, videoCreatorId, videoFileId, videoPageLimit, videoUsername]);
 
   const loadMoreVideos = useCallback(async () => {
     const cursor = nextVideoCursorRef.current;
@@ -159,24 +182,40 @@ export function useArchiveData({
       || Date.now() < loadMoreRetryAfterRef.current
     ) return;
     const generation = videoGenerationRef.current;
+    const controller = new AbortController();
+    videoRequestControllerRef.current = controller;
     loadingMoreVideosRef.current = true;
     setLoadingMoreVideos(true);
     try {
-      const page = await fetchVideoPage(cursor);
-      if (generation !== videoGenerationRef.current) return;
+      const page = await fetchVideoPage(cursor, controller.signal);
+      if (controller.signal.aborted || generation !== videoGenerationRef.current) return;
       setVideos((current) => mergeVideoPage(current, page).videos);
       nextVideoCursorRef.current = page.nextCursor;
       setNextVideoCursor(page.nextCursor);
       loadMoreRetryAfterRef.current = 0;
+      setVideoError("");
     } catch (nextError) {
-      if (generation !== videoGenerationRef.current) return;
+      if (controller.signal.aborted || generation !== videoGenerationRef.current) return;
       loadMoreRetryAfterRef.current = Date.now() + VIDEO_PAGE_RETRY_DELAY_MS;
-      setError(errorMessage("more videos", nextError));
+      setVideoError(errorMessage("more videos", nextError));
     } finally {
-      loadingMoreVideosRef.current = false;
-      setLoadingMoreVideos(false);
+      if (generation === videoGenerationRef.current) {
+        loadingMoreVideosRef.current = false;
+        setLoadingMoreVideos(false);
+      }
     }
   }, [configuredBase, fetchVideoPage, includeVideos, paginateVideos]);
+
+  const retry = useCallback(() => {
+    if (metadataError) setMetadataRevision((current) => current + 1);
+    if (!videoError) return;
+    if (nextVideoCursorRef.current) {
+      loadMoreRetryAfterRef.current = 0;
+      void loadMoreVideos();
+    } else {
+      setVideoRevision((current) => current + 1);
+    }
+  }, [loadMoreVideos, metadataError, videoError]);
 
   useEffect(() => {
     bookmarkGenerationRef.current += 1;
@@ -199,10 +238,10 @@ export function useArchiveData({
       username: videoUsername,
       limit: videoPageLimit,
     });
-    const payload = await fetch(`${base}/api/videos?${params}`, {
+    const payload = await fetchJson<SavedVideo[] | FeedPage>(`${base}/api/videos?${params}`, {
       cache: "no-store",
       signal,
-    }).then(assertJsonResponse<SavedVideo[] | FeedPage>);
+    });
     return normalizeVideoPage(payload);
   }, [base, videoCreatorId, videoPageLimit, videoUsername]);
 
@@ -262,14 +301,22 @@ export function useArchiveData({
     }
   }, [configuredBase, fetchBookmarkedPage, includeVideos]);
 
+  const sources = includeVideos ? [metadataSource, videoSource] : [metadataSource];
+  const hasLiveData = sources.some((status) => status === "live" || status === "refreshing");
+  const isLoading = sources.some((status) => status === "loading" || status === "refreshing");
+  const source: ArchiveDataSource = !liveMode ? "mock"
+    : isLoading ? hasLiveData ? "refreshing" : "loading"
+      : hasLiveData ? "live" : "error";
+
   return {
     creators,
     videos,
     bookmarkedVideos,
     stats,
     source,
-    error,
+    error: [metadataError, videoError].filter(Boolean).join(" "),
     refresh,
+    retry,
     hasMoreVideos: Boolean(nextVideoCursor),
     hasMoreBookmarkedVideos: Boolean(nextBookmarkCursor),
     loadingMoreVideos,
@@ -285,14 +332,6 @@ export function useArchiveData({
 function errorMessage(resource: string, error: unknown) {
   const detail = error instanceof Error ? error.message : String(error);
   return `Could not load ${resource}: ${detail}`;
-}
-
-async function assertJsonResponse<T>(response: Response): Promise<T> {
-  if (!response.ok) {
-    const payload = await response.json().catch(() => ({})) as { error?: string };
-    throw new Error(payload.error || `Live archive request failed (${response.status})`);
-  }
-  return response.json() as Promise<T>;
 }
 
 export function normalizeVideoPage(payload: SavedVideo[] | FeedPage): FeedPage {

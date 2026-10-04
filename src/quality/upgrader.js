@@ -138,7 +138,7 @@ export class QualityUpgrader {
       }
       staging = await mkdtemp(path.join(this.config.downloadDir, '.quality-stage-'));
       const downloaded = await this.downloadVideo(record.source_url, {
-        ...this.config, outputDir: staging, metadata, format: 'bv*+ba/b',
+        ...this.config, downloadDir: undefined, outputDir: staging, metadata, format: 'bv*+ba/b',
       });
       const candidatePath = downloaded?.primaryFile || downloaded?.filePath;
       if (!candidatePath || !isInsideDirectory(candidatePath, staging) || !await fileExists(candidatePath)) {
@@ -177,7 +177,7 @@ export class QualityUpgrader {
         try {
           await this.onUpgrade({
             videoId: record.video_id, username: record.username, sourceUrl: record.source_url,
-            previous: original, current: candidate,
+            previous: original, current: candidate, stage: stageLabel(stage),
           });
         } catch (error) {
           this.logger.warn?.(`[quality] Upgrade notification failed for ${record.video_id}: ${error.message}`);

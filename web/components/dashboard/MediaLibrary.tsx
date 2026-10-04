@@ -286,7 +286,7 @@ export function MediaLibrary() {
                     </a>
                   ) : null}
                   {view === "active" ? (
-                    <a href={post.downloadUrl} download>
+                    <a href={post.downloadUrl}>
                       <Download size={15} /> Download
                     </a>
                   ) : null}

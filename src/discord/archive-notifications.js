@@ -1,4 +1,3 @@
-import { EmbedBuilder } from 'discord.js';
 import { resolveMonitorDeliveryScope, sendVideoAlert } from './client.js';
 
 function guildIdOf(channel) {
@@ -66,17 +65,28 @@ export async function sendQualityUpgradeAlert({ client, config, store, upgrade }
   const subscriptions = store.listWatchSubscriptions?.(upgrade.username, 'tiktok') ?? [];
   if (!await hasWatchInGuild(client, subscriptions, guildId)) return false;
 
-  const embed = new EmbedBuilder()
-    .setTitle('Archived Video Quality Upgraded')
-    .setColor(0x2ecc71)
-    .addFields(
-      { name: 'Creator', value: `@${String(upgrade.username || 'unknown').slice(0, 90)}`, inline: true },
-      { name: 'Previous', value: `${upgrade.previous.width}x${upgrade.previous.height}`, inline: true },
-      { name: 'New', value: `${upgrade.current.width}x${upgrade.current.height}`, inline: true },
-    )
-    .setTimestamp(new Date());
+  const username = String(upgrade?.username ?? '').replace(/[^A-Za-z0-9._]/g, '');
+  const videoId = String(upgrade?.videoId ?? '').replace(/[^0-9]/g, '');
   const sourceUrl = String(upgrade.sourceUrl ?? '');
-  if (/^https:\/\/(?:www\.)?tiktok\.com\//i.test(sourceUrl)) embed.setURL(sourceUrl);
-  await channel.send({ embeds: [embed], allowedMentions: { parse: [] } });
+  const url = /^https:\/\/www\.tiktok\.com\/@[A-Za-z0-9._]+\/video\/\d+(?:[?#].*)?$/.test(sourceUrl)
+    ? sourceUrl
+    : username && videoId ? `https://www.tiktok.com/@${username}/video/${videoId}` : '';
+  const from = upgrade?.previous ?? {};
+  const to = upgrade?.current ?? {};
+  const width = Number(to.width);
+  const height = Number(to.height);
+  if (![Number(from.width), Number(from.height), width, height].every((n) => Number.isInteger(n) && n > 0)) {
+    throw new Error('Cannot notify about an upgrade without verified dimensions.');
+  }
+  const stage = ['6h', '24h', '72h'].includes(upgrade?.stage) ? upgrade.stage : 'scheduled';
+  const codec = String(to.codec ?? '').replace(/[^A-Za-z0-9._-]/g, '');
+  const lines = [
+    '✅ **TikTok video quality upgraded**',
+    username ? `Account: @${username}` : `Video: ${videoId || 'unknown'}`,
+    `Quality: ${Number(from.width)}×${Number(from.height)} → ${width}×${height}${codec ? ` (${codec})` : ''}`,
+    `Check: ${stage}`,
+    ...(url ? [`Post: ${url}`] : []),
+  ];
+  await channel.send({ content: lines.join('\n'), allowedMentions: { parse: [] } });
   return true;
 }

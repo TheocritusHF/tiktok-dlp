@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { ensureRuntimeDirs, loadConfig } from '../src/config.js';
 import { createDownloadService } from '../src/download/service.js';
-import { instagramAdapter, parseGalleryDlProbeOutput, xAdapter } from '../src/platforms/index.js';
+import { instagramAdapter, parseGalleryDlProbeOutput, recordPrivateListingOutcome, resetPrivateListingBreakerForTests, shouldSkipPrivateListings, xAdapter } from '../src/platforms/index.js';
 import { createStore } from '../src/state/store.js';
 
 test('gallery-dl adapters download normalized Instagram carousels and X mixed media', async () => {
@@ -531,3 +531,62 @@ function argumentValue(args, flag) {
   const index = args.indexOf(flag);
   return index < 0 ? '' : args[index + 1];
 }
+
+test('challenged Instagram private sessions cool down instead of stalling every listing', () => {
+  resetPrivateListingBreakerForTests();
+  try {
+    assert.equal(shouldSkipPrivateListings(1_000), false);
+
+    const denied = Object.assign(new Error('login challenged'), { kind: 'access_denied', stage: 'login' });
+    assert.equal(recordPrivateListingOutcome(denied, 1_000), true);
+    assert.equal(shouldSkipPrivateListings(1_001), true);
+    // Login cooldown is 24 hours.
+    assert.equal(shouldSkipPrivateListings(1_000 + 24 * 60 * 60 * 1000 - 1), true);
+    assert.equal(shouldSkipPrivateListings(1_000 + 24 * 60 * 60 * 1000 + 1), false);
+
+    // Unrelated failures and creator-specific denials do not pause the account.
+    resetPrivateListingBreakerForTests();
+    assert.equal(recordPrivateListingOutcome(Object.assign(new Error('bad'), { kind: 'invalid_output' }), 2_000), false);
+    assert.equal(recordPrivateListingOutcome(Object.assign(new Error('Not authorized to view user'), {
+      kind: 'access_denied', stage: 'lookup',
+    }), 2_000), false);
+    assert.equal(shouldSkipPrivateListings(2_001), false);
+
+    // An in-flight success cannot reopen a restricted account.
+    assert.equal(recordPrivateListingOutcome(denied, 3_000), true);
+    assert.equal(shouldSkipPrivateListings(3_001), true);
+    assert.equal(recordPrivateListingOutcome(null, 3_002), false);
+    assert.equal(shouldSkipPrivateListings(3_003), true);
+  } finally {
+    resetPrivateListingBreakerForTests();
+  }
+});
+
+test('instagram private helper pins one stable device fingerprint', async (t) => {
+  const { execFileSync } = await import('node:child_process');
+  let python;
+  try {
+    python = execFileSync('python3', ['--version'], { stdio: ['ignore', 'pipe', 'pipe'] }).toString().trim();
+  } catch {
+    t.skip('python3 is not available');
+    return;
+  }
+  assert.match(python, /Python 3/);
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'ig-device-'));
+  const deviceFile = path.join(dir, 'device.json');
+  const script = new URL('../scripts/instagram-private-list.py', import.meta.url).pathname;
+  // instagrapi uses request_timeout as a sleep before every API request.
+  assert.doesNotMatch(await readFile(script, 'utf8'), /\.request_timeout\s*=/);
+  const probe = 'import importlib.util, json;'
+    + `spec = importlib.util.spec_from_file_location('igpriv', ${JSON.stringify(script)});`
+    + 'mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod);'
+    + `s = mod.ensure_device_settings(${JSON.stringify(deviceFile)});`
+    + 'print(json.dumps({"uuids": s["uuids"], "device": s["device_settings"]}))';
+  const first = JSON.parse(execFileSync('python3', ['-c', probe], { encoding: 'utf8' }));
+  const second = JSON.parse(execFileSync('python3', ['-c', probe], { encoding: 'utf8' }));
+  assert.deepEqual(second.uuids, first.uuids);
+  assert.equal(second.device.manufacturer, 'Google');
+  const info = await stat(deviceFile);
+  assert.equal(info.mode & 0o777, 0o600);
+  await rm(dir, { recursive: true, force: true });
+});

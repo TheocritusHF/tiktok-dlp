@@ -53,7 +53,7 @@ body {
   margin: 0;
   background: var(--ink);
   color: var(--paper);
-  font-family: var(--font-geist-sans), system-ui, sans-serif;
+  font-family: system-ui, sans-serif;
   text-rendering: optimizeLegibility;
 }
 

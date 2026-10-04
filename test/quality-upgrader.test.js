@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { createStore } from '../src/state/store.js';
 import { QualityUpgrader, hasHigherResolution, bestAdvertisedVideo } from '../src/quality/upgrader.js';
+import { downloadVideo as downloadTikTokVideo } from '../src/tiktok/ytdlp.js';
 
 const HOUR = 60 * 60_000;
 const ID = '1234567890123456789';
@@ -46,6 +47,43 @@ test('resolution comparisons ignore orientation, require both dimensions to impr
     { width: 720, height: 1280, vcodec: 'hevc' }]), { width: 720, height: 1280, vcodec: 'hevc' });
 });
 
+test('quality upgrade keeps the real downloader candidate in staging until verification', async () => {
+  const f = await fixture();
+  try {
+    const fakeYtDlp = path.join(f.root, 'fake-yt-dlp');
+    await writeFile(fakeYtDlp, `#!/usr/bin/env node
+const fs = require('node:fs');
+const path = require('node:path');
+const args = process.argv.slice(2);
+const home = args[args.indexOf('--paths') + 1].slice('home:'.length);
+fs.writeFileSync(path.join(home, '${ID}.mp4'), 'new-720-long');
+`);
+    await chmod(fakeYtDlp, 0o755);
+    f.store.scheduleQualityUpgrade(f.fileId, f.firstSavedAt);
+    const metadata = {
+      id: ID, title: 'Replacement video', uploader: 'example_creator',
+      formats: [{ width: 720, height: 1280, vcodec: 'h264' }],
+    };
+    const warnings = [];
+    const worker = new QualityUpgrader({
+      store: f.store,
+      config: { downloadDir: f.downloadDir },
+      inspect,
+      probeVideo: async () => metadata,
+      downloadVideo: (url, options) => downloadTikTokVideo(url, { ...options, ytdlpPath: fakeYtDlp }),
+      now: () => f.firstSavedAt + 6 * HOUR,
+      logger: { info() {}, warn(message) { warnings.push(message); }, error() {} },
+    });
+
+    await worker.runOnce();
+
+    assert.deepEqual(warnings, []);
+    assert.equal(await readFile(f.filepath, 'utf8'), 'new-720-long');
+    assert.equal(f.store.listQualityUpgradeRecords()[0].stage, 1);
+    assert.equal(f.store.getLatestFileByPost('tiktok', ID).path, f.filepath);
+  } finally { await f.cleanup(); }
+});
+
 test('6, 24 and 72 hour checks survive DB restart and finish after the final check', async () => {
   const f = await fixture();
   try {
@@ -75,8 +113,8 @@ test('6, 24 and 72 hour checks survive DB restart and finish after the final che
     assert.equal((await stat(f.filepath)).size, f.store.getLatestFileByPost('tiktok', ID).size_bytes);
     assert.equal(f.store.getLatestFileByPost('tiktok', ID).id, f.fileId);
     assert.equal(f.store.db.prepare("SELECT file_id FROM link_tokens WHERE token = 'existing-archive-link'").get().file_id, f.fileId);
-    assert.deepEqual(notifications.map((upgrade) => [upgrade.username, upgrade.previous.width, upgrade.current.width]),
-      [['example_creator', 576, 720]]);
+    assert.deepEqual(notifications.map((upgrade) => [upgrade.username, upgrade.previous.width, upgrade.current.width, upgrade.stage]),
+      [['example_creator', 576, 720, '6h']]);
     assert.deepEqual(f.store.listMediaAssetsForFile(f.fileId)
       .filter((asset) => asset.path === f.filepath)
       .map((asset) => [asset.width, asset.height, asset.size_bytes]), [[720, 1280, 12]]);

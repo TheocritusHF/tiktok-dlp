@@ -142,7 +142,7 @@ Recommended production setup:
 For direct local development:
 
 - Node.js `>=22.13.0`
-- `yt-dlp`, `gallery-dl` 1.32.10, and ffmpeg for backend download work
+- `yt-dlp`, `gallery-dl` 1.32.14, and ffmpeg for backend download work
 - Python 3 and ffmpeg for the live Rewind metadata and thumbnail fallbacks
 
 ## Quick start with Docker
@@ -500,6 +500,40 @@ download service now consumes these adapters
 and persists their ordered assets; Discord presentation can use the resulting
 post bundle or individual media files.
 
+Instagram monitor polls run no more often than every 15 minutes per creator
+(or the configured poll interval if longer), with one Instagram creator poll
+at a time. TikTok keeps its configured cadence. This reduces scheduled
+Instagram polls by about 93% compared with a one-minute interval; new posts
+and Stories can take up to 15 minutes to appear. Failed Instagram polls back
+off from 15 minutes to six hours, and failed Story checks are not treated as
+successful empty polls.
+
+Account-wide rate limits pause Instagram listings and extraction for six
+hours. Login failures, challenges, and account-review feedback pause them for
+24 hours. The pause is saved in `DATA_DIR/instagram-account-cooldown.json`, so
+restarting the bot or forcing a watch run does not bypass it. Instagram
+extractor requests have no immediate HTTP retries, and the gallery-dl
+fallback does not run during an account pause. The private client does not
+attempt to solve security challenges automatically. These are local conservative
+delays, not Instagram-provided recovery times or a guarantee against bans.
+Creator-specific permission failures remain isolated to that creator.
+
+Use an account whose loss would be acceptable, preserve its existing device
+settings and network route, and avoid repeated logouts, cookie refreshes, or
+manual force-runs when a restriction appears. Resolve security/account prompts
+in the official Instagram app, confirm ordinary browsing works, and let the
+pause expire before one verification attempt. Do not rotate accounts or routes
+to work around a restriction. Automated access can still lead to account
+restrictions; use an approved API/integration where it supports the needed
+content if account reliability is essential.
+
+The Docker build applies `scripts/patch-gallery-dl.py` to pinned gallery-dl
+1.32.14: Instagram merged-video variants may omit width/height, which are
+reported as unknown without changing the selected MP4. The build tests the
+real parser with missing and present dimensions and an image Story. The patch
+intentionally rejects a different gallery-dl version or source layout; review
+and remove it when upgrading to an upstream release that passes those cases.
+
 If TikTok requires a logged-in session, export a **full** Netscape `tiktok.com`
 cookie jar (not a hand-picked subset). The working live path needed
 `sessionid`, `ttwid`, `msToken`, `odin_tt`, `sid_ucp_v1`, `uid_tt`, and the rest
@@ -653,7 +687,13 @@ to roll production backward if a newer commit is already deployed.
 Register the runner under repo **Settings → Actions → Runners**. Add the label
 `yufeihl` and use a work directory outside the production checkout, for example
 `~/actions-runner`. Keep `.env`, cookies, `data/`, and `.secrets/` on the host;
-they are not in git.
+they are not in git. Deployment uses a clean checkout at
+`/home/yufei/tiktok-dlp-production`, with `.env`, `.secrets`, `cookies`, and `data`
+linked to the existing runtime paths in `/home/yufei/tiktok-discord-downloader`.
+The fixed Compose project name `tiktok-discord-downloader` preserves the existing
+containers, network, and cache volume. Develop in the original checkout; only
+committed `main` revisions deploy. The workflow sets up Node.js 22 for host-side backup tools;
+it does not depend on an interactive shell loading nvm.
 
 ## Operational notes
 

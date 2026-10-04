@@ -2,6 +2,8 @@ import { extractVideoId, normalizeUsername, profileUrl as makeProfileUrl, storyU
 import { normalizePlatform } from '../platforms/references.js';
 
 const DEFAULT_POLL_INTERVAL_MS = 60 * 1000;
+const INSTAGRAM_POLL_INTERVAL_MS = 15 * 60 * 1000;
+const INSTAGRAM_BACKOFF_MAX_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_SCAN_LIMIT = 5;
 const DEFAULT_BURST_SCAN_LIMIT = 20;
 const DEFAULT_CHECK_CONCURRENCY = 2;
@@ -444,11 +446,17 @@ export class TikTokMonitor {
       dueWatches.push(watch);
     }
 
-    await runWithConcurrency(dueWatches, this.checkConcurrency, async (watch) => {
+    const processWatch = async (watch) => {
       const partial = await this.#processWatch(watch);
       mergeSummary(summary, partial);
       downloadPromises.push(...partial.downloadPromises);
-    });
+    };
+    // One Instagram account serves every watch. Serialize its polls without
+    // making unrelated platforms wait for that account's network requests.
+    await Promise.all([
+      runWithConcurrency(dueWatches.filter((watch) => watch.platform !== 'instagram'), this.checkConcurrency, processWatch),
+      runWithConcurrency(dueWatches.filter((watch) => watch.platform === 'instagram'), 1, processWatch),
+    ]);
 
     if (waitForDownloads && downloadPromises.length) {
       const results = await Promise.allSettled(downloadPromises);
@@ -502,6 +510,7 @@ export class TikTokMonitor {
             maxMs: this.backoffMaxMs,
           }),
           now,
+          watch?.platform ?? 'tiktok',
         ),
       );
       return partial;
@@ -537,6 +546,12 @@ export class TikTokMonitor {
           creator_id: identity.creatorId || watch?.creator_id,
         };
       }
+      // Reuse only this poll's resolved identity; the next poll still refreshes it.
+      const resolvedProfile = normalized.platform === 'instagram' ? {
+        platform: normalized.platform,
+        username: normalized.username,
+        creatorId: resolveProfileCreatorId(profileResult),
+      } : undefined;
       const profileEntries = normalizeProfileListResult(profileResult).entries;
       const profileWindow = profileEntries.slice(0, this.scanLimit);
       const profileProcessing = await this.#processVideoEntries(profileWindow, {
@@ -556,6 +571,7 @@ export class TikTokMonitor {
           username: normalized.username,
           limit: this.burstScanLimit,
           watch,
+          resolvedProfile,
           burst: true,
         });
         const burstEntries = normalizeProfileListResult(burstProfileResult).entries;
@@ -568,7 +584,7 @@ export class TikTokMonitor {
         });
       }
 
-      const storyResult = await this.#listStoryVideos(normalized, watch, now);
+      const storyResult = await this.#listStoryVideos(normalized, watch, now, resolvedProfile);
       if (storyResult.identity?.changed) {
         normalized = normalizeWatchedUser(storyResult.identity.username, normalized.platform);
         watch = {
@@ -611,6 +627,7 @@ export class TikTokMonitor {
               username: normalized.username,
               limit: this.scanLimit,
               watch,
+              resolvedProfile,
             });
             await this.#processVideoEntries(highlightResult.entries ?? [], {
               partial,
@@ -629,16 +646,20 @@ export class TikTokMonitor {
         }
       }
 
-      await Promise.resolve(this.store.markWatchSuccess(normalized.username, now, now + this.pollIntervalMs));
+      const pollInterval = normalized.platform === 'instagram'
+        ? Math.max(this.pollIntervalMs, INSTAGRAM_POLL_INTERVAL_MS)
+        : this.pollIntervalMs;
+      await Promise.resolve(this.store.markWatchSuccess(normalized.username, now, now + pollInterval, normalized.platform));
     } catch (error) {
       partial.failures += 1;
       const failureCount = Number(watch?.failure_count ?? 0);
-      const nextCheckAt = now + calculateFailureBackoffMs(failureCount, {
-        baseMs: this.backoffBaseMs,
-        maxMs: this.backoffMaxMs,
-      });
-      await Promise.resolve(this.store.markWatchFailure(normalized.username, error, nextCheckAt, now));
-      this.logger?.warn?.(`TikTok monitor failed for @${normalized.username}: ${error instanceof Error ? error.message : String(error)}`);
+      const instagram = normalized.platform === 'instagram';
+      const nextCheckAt = Math.max(Number(error?.retryAt) || 0, now + calculateFailureBackoffMs(failureCount, {
+        baseMs: instagram ? Math.max(this.backoffBaseMs, INSTAGRAM_POLL_INTERVAL_MS) : this.backoffBaseMs,
+        maxMs: instagram ? Math.max(this.backoffMaxMs, INSTAGRAM_BACKOFF_MAX_MS) : this.backoffMaxMs,
+      }));
+      await Promise.resolve(this.store.markWatchFailure(normalized.username, error, nextCheckAt, now, normalized.platform));
+      this.logger?.warn?.(`${normalized.platform} monitor failed for @${normalized.username}: ${error instanceof Error ? error.message : String(error)}`);
     }
 
     return partial;
@@ -834,7 +855,7 @@ export class TikTokMonitor {
       return { accepted: false, reason: 'not_retryable', failure };
     }
 
-    const watch = await Promise.resolve(this.store.getWatch?.(failure.username));
+    const watch = await Promise.resolve(this.store.getWatch?.(failure.username, failure.platform ?? 'tiktok'));
     if (!watch) return { accepted: false, reason: 'watch_not_found', failure };
     const normalized = normalizeWatchedUser(watch);
     const sourceUrl = String(failure.source_url ?? '').trim();
@@ -858,6 +879,7 @@ export class TikTokMonitor {
       sourceUrl,
       seenRecord: {
         videoId: id,
+        platform: normalized.platform,
         username: normalized.username,
         sourceUrl,
         title: failure.title ?? '',
@@ -886,13 +908,14 @@ export class TikTokMonitor {
     }
   }
 
-  async #listStoryVideos(normalized, watch, now) {
+  async #listStoryVideos(normalized, watch, now, resolvedProfile) {
     if (!this.#listProfileStories) return { entries: [], identity: null };
     try {
       const storyResult = await this.#listProfileStories(normalized.storyUrl, {
         username: normalized.username,
         limit: this.scanLimit,
         watch,
+        resolvedProfile,
       });
       const { entries } = normalizeProfileListResult(storyResult);
       // Array-shaped results normalize to empty metadata, so identity recording
@@ -908,6 +931,9 @@ export class TikTokMonitor {
         })),
       };
     } catch (error) {
+      // Instagram story failures must back off the account's watch, rather
+      // than being recorded as a successful empty poll.
+      if (normalized.platform === 'instagram') throw error;
       this.logger?.warn?.(`TikTok story check failed for @${normalized.username}: ${error instanceof Error ? error.message : String(error)}`);
       return { entries: [], identity: null };
     }
