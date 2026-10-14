@@ -167,3 +167,7 @@ function archiveDate(value, fallback) {
   if (!Number.isFinite(date.getTime()) || date.getUTCFullYear() < 1970 || date.getUTCFullYear() > 9999) throw new Error('Invalid Instagram archive date.');
   return date;
 }
+
+export async function assertExistingDirectory(directory) {
+  await ensureExistingParents(directory, directory);
+}

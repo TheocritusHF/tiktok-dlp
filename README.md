@@ -479,7 +479,8 @@ removes only this download's owned files, never the shared daily directory.
 
 Set `INSTAGRAM_ARCHIVE_LAYOUT=legacy` to keep per-item folders for future downloads.
 Existing files and database paths are not moved on startup; their current links
-remain valid. TikTok and X retain their existing archive layouts.
+remain valid. Optional [offline migration and targeted rollback](docs/instagram-archive-migration.md)
+can organize existing Instagram media after a read-only plan and a fresh backup. TikTok and X retain their existing archive layouts.
 
 Optional `DISCORD_INSTAGRAM_NEW_POSTS_CHANNEL_ID` and
 `DISCORD_INSTAGRAM_NEW_STORIES_CHANNEL_ID` add dedicated Instagram archive copies.
