@@ -30,6 +30,13 @@ RUN apt-get update \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/*
 
+# Separate Python module for Instagram DASH; the standalone TikTok binary is unchanged.
+COPY requirements-instagram-dash.txt /tmp/requirements-instagram-dash.txt
+RUN python3 -m pip install --no-cache-dir --break-system-packages --no-deps \
+      --require-hashes --target /opt/instagram-dash -r /tmp/requirements-instagram-dash.txt \
+  && PYTHONPATH=/opt/instagram-dash python3 -c 'from yt_dlp.version import __version__; assert __version__ == "2026.08.19"' \
+  && rm /tmp/requirements-instagram-dash.txt
+
 COPY scripts/verify-gallery-dl.py /tmp/verify-gallery-dl.py
 RUN python3 /tmp/verify-gallery-dl.py && rm /tmp/verify-gallery-dl.py
 

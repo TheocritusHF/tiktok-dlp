@@ -28,6 +28,7 @@ const MAX_STDERR_BYTES = 256 * 1024;
 const MAX_COOKIE_BYTES = 5 * 1024 * 1024;
 const OUTPUT_SCAN_INTERVAL_MS = 100;
 const CHILD_KILL_GRACE_MS = 2_000;
+const INSTAGRAM_DASH_MODULE = '/opt/instagram-dash/yt_dlp';
 
 const MEDIA_EXTENSIONS = new Set([
   'avif', 'gif', 'heic', 'jpeg', 'jpg', 'm4v', 'mkv', 'mov', 'mp4', 'png', 'webm', 'webp',
@@ -638,31 +639,45 @@ export async function downloadGalleryDlPost(referenceInput, options = {}) {
     const outputDir = await mkdtemp(path.join(settings.tempParentDir, `${reference.platform}-gallery-dl-`));
 
     try {
-      const args = buildDownloadArgs(reference, settings, runtime, outputDir);
+      // Keep listing/probing on HTTPS merged URLs; enable DASH only while downloading videos.
+      const instagramDash = reference.platform === 'instagram'
+        && probe.assets.some((asset) => asset.kind === 'video');
+      const args = buildDownloadArgs(reference, settings, runtime, outputDir, instagramDash);
       await runGalleryDl(settings.executable, args, {
         ...settings,
         outputDir,
+        instagramDash,
       });
       const artifacts = await inspectOutputDirectory(outputDir, settings, {
         expectedCount: probe.assets.length,
         allowPartial: false,
       });
       const normalizedArtifacts = await normalizeArtifactNames(outputDir, artifacts);
-      const assets = probe.assets.map((asset, index) => {
+      const assets = [];
+      for (const [index, asset] of probe.assets.entries()) {
         const artifact = normalizedArtifacts[index];
         const extension = path.extname(artifact.filename).slice(1).toLowerCase();
-        return {
+        const measured = instagramDash && asset.kind === 'video'
+          ? await probeSavedInstagramVideo(artifact.filePath, settings)
+          : {};
+        assets.push({
           ...asset,
+          ...measured,
           extension,
           mimeType: mimeTypeFor(extension),
           filePath: artifact.filePath,
           filename: artifact.filename,
           sizeBytes: artifact.sizeBytes,
-        };
-      });
+        });
+      }
+      const measuredPost = assets.length === 1 && assets[0].kind === 'video' && instagramDash
+        ? { width: assets[0].width, height: assets[0].height, duration: assets[0].duration }
+        : {};
 
       return {
         ...probe,
+        post: { ...probe.post, ...measuredPost },
+        ...measuredPost,
         outputDir,
         assets,
         totalSizeBytes: assets.reduce((total, asset) => total + asset.sizeBytes, 0),
@@ -769,9 +784,18 @@ function buildProbeArgs(reference, settings, runtime) {
   ];
 }
 
-function buildDownloadArgs(reference, settings, runtime, outputDir) {
+function buildDownloadArgs(reference, settings, runtime, outputDir, instagramDash = false) {
+  const videoOptions = instagramDash ? [
+    '-o', 'extractor.instagram.videos=true',
+    '-o', `downloader.ytdl.module=${INSTAGRAM_DASH_MODULE}`,
+    '-o', 'downloader.ytdl.format=bestvideo*+bestaudio/best',
+    // Keep temporary names bounded and predictable without altering the TikTok executable.
+    '-o', 'downloader.ytdl.part=false',
+    '-o', 'downloader.ytdl.raw-options={"nopart":true,"continuedl":false,"concurrent_fragment_downloads":1}',
+  ] : [];
   return [
     ...buildCommonArgs(reference, settings, runtime, settings.maxAssets),
+    ...videoOptions,
     '--no-postprocessors',
     '--filesize-max',
     String(settings.maxItemBytes),
@@ -936,6 +960,7 @@ async function runGalleryDlProcess(executable, args, options) {
         env: galleryDlChildEnv(),
         shell: false,
         windowsHide: true,
+        ...(options.instagramDash && process.platform !== 'win32' ? { detached: true } : {}),
       });
     } catch (cause) {
       reject(classifySpawnFailure(cause));
@@ -967,7 +992,12 @@ async function runGalleryDlProcess(executable, args, options) {
     const stop = (error) => {
       if (settled || forcedError) return;
       forcedError = error;
-      child.kill?.('SIGKILL');
+      if (options.instagramDash && process.platform !== 'win32' && child.pid) {
+        try { process.kill(-child.pid, 'SIGKILL'); }
+        catch { child.kill?.('SIGKILL'); }
+      } else {
+        child.kill?.('SIGKILL');
+      }
       killFallback = setTimeout(() => finish(forcedError), CHILD_KILL_GRACE_MS);
       killFallback.unref?.();
     };
@@ -1062,12 +1092,20 @@ async function inspectOutputDirectory(outputDir, settings, { expectedCount = nul
     if (entry.isDirectory() || entry.isSymbolicLink() || !entry.isFile()) {
       throw galleryDlError('unsafe_artifact', 'gallery-dl produced an unexpected filesystem artifact.');
     }
-    if (!isAllowedArtifactFilename(entry.name, allowPartial)) {
+    const dashTemporary = allowPartial && settings.instagramDash
+      && isInstagramDashTemporaryFilename(entry.name);
+    if (!isAllowedArtifactFilename(entry.name, allowPartial) && !dashTemporary) {
       throw galleryDlError('unsafe_artifact', 'gallery-dl produced an unexpected output filename.');
     }
     const filePath = path.join(root, entry.name);
     assertContainedPath(root, filePath);
-    const info = await lstat(filePath);
+    let info;
+    try { info = await lstat(filePath); }
+    catch (error) {
+      // DASH merging deletes temporary files while the size guard is scanning them.
+      if (allowPartial && error?.code === 'ENOENT') continue;
+      throw error;
+    }
     if (!info.isFile() || info.isSymbolicLink()) {
       throw galleryDlError('unsafe_artifact', 'gallery-dl produced a non-regular media file.');
     }
@@ -1081,13 +1119,53 @@ async function inspectOutputDirectory(outputDir, settings, { expectedCount = nul
     artifacts.push({ filePath, filename: entry.name, sizeBytes: info.size });
   }
 
-  if (artifacts.length > settings.maxAssets) {
+  const assetCount = allowPartial && settings.instagramDash
+    ? new Set(artifacts.map((artifact) => artifact.filename.match(/^asset_(\d{1,6}|None)\./)?.[1])).size
+    : artifacts.length;
+  if (assetCount > settings.maxAssets || (allowPartial && settings.instagramDash && artifacts.length > settings.maxAssets * 8)) {
     throw galleryDlError('asset_limit', `gallery-dl produced more than ${settings.maxAssets} media assets.`);
   }
   if (!allowPartial && expectedCount != null && artifacts.length !== expectedCount) {
     throw galleryDlError('incomplete_download', 'gallery-dl did not download every media asset in the post.');
   }
   return artifacts.sort(compareArtifacts);
+}
+
+// Accepted only during an Instagram DASH download; never accepted as final media.
+function isInstagramDashTemporaryFilename(filename) {
+  return /^asset_(?:\d{1,6}|None)\.(?:(?:f[A-Za-z0-9_-]{1,128}|temp)\.)?(?:mp4|m4v|m4a|mkv|mov|webm|opus)(?:\.part(?:-Frag\d{1,8})?|\.ytdl(?:\.tmp)?|-Frag\d{1,8})?$/.test(filename);
+}
+
+async function probeSavedInstagramVideo(filePath, settings) {
+  let stdout;
+  try {
+    ({ stdout } = await runGalleryDl('ffprobe', [
+      '-v', 'error', '-protocol_whitelist', 'file,pipe',
+      '-show_entries', 'stream=codec_type,codec_name,width,height,duration:format=duration',
+      '-of', 'json', '-i', filePath,
+    ], { ...settings, platform: 'local', accountOptions: null, timeoutMs: Math.min(settings.timeoutMs, 15_000) }));
+  } catch (cause) {
+    if (cause?.kind === 'aborted') throw cause;
+    throw galleryDlError('media_probe_failed', 'Could not verify the saved Instagram video.', { cause });
+  }
+  let info;
+  try { info = JSON.parse(stdout); }
+  catch { throw galleryDlError('media_probe_failed', 'ffprobe returned invalid Instagram video metadata.'); }
+  const streams = Array.isArray(info?.streams) ? info.streams : [];
+  const video = streams.find((stream) => stream.codec_type === 'video');
+  const width = Number(video?.width);
+  const height = Number(video?.height);
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) {
+    throw galleryDlError('media_probe_failed', 'The saved Instagram asset has no valid video dimensions.');
+  }
+  const duration = Number(info?.format?.duration ?? video.duration);
+  return {
+    width,
+    height,
+    duration: Number.isFinite(duration) && duration >= 0 ? duration : null,
+    videoCodec: String(video.codec_name ?? ''),
+    audioStreams: streams.filter((stream) => stream.codec_type === 'audio').length,
+  };
 }
 
 function isAllowedArtifactFilename(filename, allowPartial) {

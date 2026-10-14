@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
+import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { ensureRuntimeDirs, loadConfig } from '../src/config.js';
 import { createDownloadService } from '../src/download/service.js';
@@ -42,11 +43,11 @@ test('gallery-dl adapters download normalized Instagram carousels and X mixed me
       })),
       [
         { position: 1, remoteId: 'ig-media-1', kind: 'image', mimeType: 'image/jpeg', filename: 'asset_001.jpg', sizeBytes: 7 },
-        { position: 2, remoteId: 'ig-media-2', kind: 'video', mimeType: 'video/mp4', filename: 'asset_002.mp4', sizeBytes: 7 },
+        { position: 2, remoteId: 'ig-media-2', kind: 'video', mimeType: 'video/mp4', filename: 'asset_002.mp4', sizeBytes: fixture.videoBytes },
         { position: 3, remoteId: 'ig-media-3', kind: 'image', mimeType: 'image/jpeg', filename: 'asset_003.jpg', sizeBytes: 7 },
       ],
     );
-    assert.equal(instagram.totalSizeBytes, 21);
+    assert.equal(instagram.totalSizeBytes, 14 + fixture.videoBytes);
 
     const x = await xAdapter.download('https://twitter.com/OpenAI/status/123?s=20', fixture.options);
     assert.equal(x.post.platform, 'x');
@@ -133,6 +134,7 @@ test('Instagram Story downloads require a scoped session and normalize one exact
       publishedAt: '2026-08-30T12:00:00.000Z',
       mediaType: 'story',
       assetCount: 1,
+      width: 1080, height: 1920, duration: 0.2,
     });
     assert.deepEqual(story.assets.map((asset) => ({
       remoteId: asset.remoteId,
@@ -404,12 +406,14 @@ async function makeFakeGalleryDl({ withCookies = true } = {}) {
     '.instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\tig-session-secret',
     '',
   ].join('\n'));
-  await writeFile(executable, fakeGalleryDlSource(logPath));
+  const video = execFileSync('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', 'color=c=blue:s=1080x1920:r=5', '-t', '0.2', '-c:v', 'libx264', '-preset', 'ultrafast', '-f', 'mp4', '-movflags', 'frag_keyframe+empty_moov', 'pipe:1']);
+  await writeFile(executable, fakeGalleryDlSource(logPath, video.toString('base64')));
   await chmod(executable, 0o755);
 
   return {
     dir,
     logPath,
+    videoBytes: video.length,
     instagramCookiesFile,
     xCookiesFile,
     options: {
@@ -417,8 +421,8 @@ async function makeFakeGalleryDl({ withCookies = true } = {}) {
       galleryDlTempDir: path.join(dir, 'staging'),
       galleryDlTimeoutMs: 2_000,
       galleryDlMaxAssets: 20,
-      galleryDlMaxItemBytes: 1_024,
-      galleryDlMaxTotalBytes: 4_096,
+      galleryDlMaxItemBytes: 1_048_576,
+      galleryDlMaxTotalBytes: 4_194_304,
       ...(withCookies ? {
         instagramCookiesFile,
         instagramProxy: 'http://instagram-proxy.test:8080',
@@ -430,7 +434,7 @@ async function makeFakeGalleryDl({ withCookies = true } = {}) {
   };
 }
 
-function fakeGalleryDlSource(logPath) {
+function fakeGalleryDlSource(logPath, videoBase64) {
   return `#!/usr/bin/env node
 const fs = require('node:fs');
 const path = require('node:path');
@@ -467,7 +471,7 @@ if (args.includes('--dump-json')) {
       ? ['mp4']
       : url.includes('instagram.com') ? ['jpg', 'mp4', 'jpg'] : ['jpg', 'mp4'];
     for (let index = 0; index < extensions.length; index += 1) {
-      fs.writeFileSync(path.join(outputDir, 'asset_' + String(index + 1).padStart(3, '0') + '.' + extensions[index]), 'asset-' + (index + 1));
+      fs.writeFileSync(path.join(outputDir, 'asset_' + String(index + 1).padStart(3, '0') + '.' + extensions[index]), extensions[index] === 'mp4' && url.includes('instagram.com') ? Buffer.from(${JSON.stringify(videoBase64)}, 'base64') : 'asset-' + (index + 1));
     }
   }
 }
