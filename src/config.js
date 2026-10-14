@@ -60,6 +60,8 @@ export function loadConfig(env = process.env, cwd = process.cwd()) {
     discordLiveChannelId: String(env.DISCORD_LIVE_CHANNEL_ID ?? '').trim(),
     discordNewVideosChannelId: String(env.DISCORD_NEW_VIDEOS_CHANNEL_ID ?? '').trim(),
     discordNewStoriesChannelId: String(env.DISCORD_NEW_STORIES_CHANNEL_ID ?? '').trim(),
+    discordInstagramNewPostsChannelId: String(env.DISCORD_INSTAGRAM_NEW_POSTS_CHANNEL_ID ?? '').trim(),
+    discordInstagramNewStoriesChannelId: String(env.DISCORD_INSTAGRAM_NEW_STORIES_CHANNEL_ID ?? '').trim(),
     discordQualityUpgradesChannelId: String(env.DISCORD_QUALITY_UPGRADES_CHANNEL_ID ?? '').trim(),
     discordOwnerId: env.DISCORD_OWNER_ID ?? '',
     watchManagerRoleId: env.WATCH_MANAGER_ROLE_ID ?? '',

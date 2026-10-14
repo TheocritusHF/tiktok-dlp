@@ -470,6 +470,15 @@ still needs Cloudflare Access or an equivalent private access layer.
 | Paths/tools | `DATA_DIR`, `STATE_DB`, `DOWNLOAD_DIR`, `YTDLP_PATH`, `YTDLP_PROXY`, `YTDLP_COOKIES_FILE`, `YTDLP_RETRIES`, `YTDLP_TIMEOUT_SECONDS`, `GALLERY_DL_PATH`, `GALLERY_DL_TEMP_DIR`, `GALLERY_DL_TIMEOUT_SECONDS` |
 | Instagram/X sessions | `INSTAGRAM_COOKIES_FILE`, `INSTAGRAM_PROXY`, `X_COOKIES_FILE`, `X_PROXY` |
 
+Optional `DISCORD_INSTAGRAM_NEW_POSTS_CHANNEL_ID` and
+`DISCORD_INSTAGRAM_NEW_STORIES_CHANNEL_ID` add dedicated Instagram archive copies.
+The existing watch channel still receives its notification. Photo and video
+Stories use the Story channel; posts, reels and carousels use the post channel.
+Only a watch in the destination server can receive a dedicated copy; DM watches
+and watches in other servers are excluded. Each copy gets its own scoped download
+link and delivery state. If a watch already targets the dedicated channel, no
+extra copy is sent. Empty Instagram settings do not fall back to TikTok channels.
+
 Instagram and X direct-save adapters use the pinned `gallery-dl` binary for
 posts, reels, carousels, exact Instagram Story share URLs, and status media.
 Each run ignores user-level

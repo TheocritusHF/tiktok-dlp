@@ -16,11 +16,12 @@ async function hasWatchInGuild(client, subscriptions, guildId) {
 export async function sendDedicatedMonitorAlert({
   client, config, store, downloadService, result, video, watch, targets, platform,
 }) {
-  if (platform !== 'tiktok') return false;
-  const mediaType = String(video?.mediaType ?? result?.mediaType ?? '').toLowerCase();
-  const channelId = String(mediaType === 'story'
-    ? config.discordNewStoriesChannelId ?? ''
-    : config.discordNewVideosChannelId ?? '').trim();
+  if (!['tiktok', 'instagram'].includes(platform)) return false;
+  const isStory = [video?.mediaType, video?.media_type, video?.type, result?.mediaType]
+    .some((value) => String(value ?? '').toLowerCase() === 'story');
+  const channelId = String(platform === 'instagram'
+    ? (isStory ? config.discordInstagramNewStoriesChannelId : config.discordInstagramNewPostsChannelId) ?? ''
+    : (isStory ? config.discordNewStoriesChannelId : config.discordNewVideosChannelId) ?? '').trim();
   if (!channelId) return false;
 
   const channel = await client.channels.fetch(channelId);
@@ -28,7 +29,14 @@ export async function sendDedicatedMonitorAlert({
   if (!guildId || typeof channel?.send !== 'function') {
     throw new Error('The configured archive notification channel must be a text channel in a server.');
   }
-  const subscription = await hasWatchInGuild(client, targets, guildId);
+  const matchingTargets = [];
+  for (const target of targets ?? []) {
+    if ((target.platform ?? 'tiktok') !== platform) continue;
+    const scope = await resolveMonitorDeliveryScope(client, target);
+    if (scope.guildId === guildId && !scope.guildId.startsWith('dm:')) matchingTargets.push(target);
+  }
+  if (matchingTargets.some((target) => String(target.channel_id ?? target.channelId ?? '') === channelId)) return false;
+  const subscription = matchingTargets.find((target) => Number.isInteger(Number(target.id)) && Number(target.id) > 0);
   if (!Number.isInteger(Number(subscription?.id)) || Number(subscription.id) <= 0
     || String(subscription.channel_id ?? '') === channelId) return false;
 
