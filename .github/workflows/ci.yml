@@ -34,6 +34,11 @@ jobs:
           python3 -m venv /tmp/gallery-dl-check
           /tmp/gallery-dl-check/bin/pip install 'gallery-dl==1.32.16'
           /tmp/gallery-dl-check/bin/python scripts/verify-gallery-dl.py
+          /tmp/gallery-dl-check/bin/pip install --no-deps --require-hashes --target /tmp/instagram-dash -r requirements-instagram-dash.txt
+          PYTHONPATH=/tmp/instagram-dash /tmp/gallery-dl-check/bin/python -c 'from yt_dlp.version import __version__; assert __version__ == "2026.08.19"'
+
+      - name: Install video fixture tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
 
       - name: Run backend tests
         run: npm test

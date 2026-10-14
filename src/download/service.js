@@ -423,7 +423,9 @@ export class DownloadService {
     };
     const mediaType = extracted.mediaType || downloadMetadata.mediaType || inferMediaType(assets);
     const publishedAt = extracted.publishedAt ?? extracted.timestamp ?? downloadMetadata.timestamp;
-    const duration = downloadMetadata.duration ?? extracted.duration;
+    const measuredVideo = platform === 'instagram' && assets.length === 1 && assets[0].kind === 'video'
+      ? assets[0] : null;
+    const duration = measuredVideo?.duration ?? downloadMetadata.duration ?? extracted.duration;
     const mediaRecord = {
       platform,
       remoteId: videoId,
@@ -495,7 +497,8 @@ export class DownloadService {
       description: downloadMetadata.description || extracted.description || extracted.caption || '',
       thumbnailUrl: downloadMetadata.thumbnail || extracted.thumbnailUrl || extracted.thumbnail || '',
       mediaType: extracted.mediaType || downloadMetadata.mediaType || inferMediaType(assets),
-      duration: Number(downloadMetadata.duration ?? extracted.duration ?? 0) || 0,
+      duration: Number(duration ?? 0) || 0,
+      ...(measuredVideo ? { width: measuredVideo.width, height: measuredVideo.height } : {}),
       assets,
       reused: false,
     };

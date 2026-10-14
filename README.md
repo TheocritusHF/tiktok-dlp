@@ -527,6 +527,16 @@ to work around a restriction. Automated access can still lead to account
 restrictions; use an approved API/integration where it supports the needed
 content if account reliability is essential.
 
+Instagram video downloads select the best available DASH video/audio streams through
+an isolated, hash-pinned Python yt-dlp module. Listing and probe requests retain
+merged HTTPS metadata, and the standalone TikTok executable is unchanged.
+Saved Instagram video dimensions and duration are measured with ffprobe; metadata
+hints cannot overwrite those measurements. Photos and X retain their existing
+selection behavior. No media is upscaled or re-encoded, and 1080p is only available
+when the source supplies it. Source codecs such as VP9 may need Rewind playback
+conversion or a compatible local player. Existing lower-resolution archives are
+not automatically downloaded again.
+
 The Docker build pins gallery-dl 1.32.16 and runs the read-only
 `scripts/verify-gallery-dl.py` parser checks. This release handles Instagram
 video variants without width/height fields, so the old source patch is no
