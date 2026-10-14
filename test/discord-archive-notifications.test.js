@@ -131,3 +131,47 @@ test('quality upgrade notice goes only to a server still watching that creator',
   assert.equal(await sendQualityUpgradeAlert(args), false);
   assert.equal(messages.length, 1);
 });
+
+for (const [label, resultType, sourceType, expected] of [
+  ['video post', 'video', 'video', 'videos'],
+  ['image post', 'image', 'image', 'videos'],
+  ['carousel', 'mixed', 'mixed', 'videos'],
+  ['video Story', 'video', 'story', 'stories'],
+  ['photo Story', 'image', 'story', 'stories'],
+  ['Story result', 'story', 'image', 'stories'],
+]) {
+  test(`Instagram ${label} uses its configured server-scoped channel`, async () => {
+    const f = monitorFixture(resultType);
+    f.args.platform = 'instagram'; f.args.video.mediaType = sourceType;
+    f.args.targets[0].platform = 'instagram';
+    f.args.config.discordInstagramNewPostsChannelId = 'videos';
+    f.args.config.discordInstagramNewStoriesChannelId = 'stories';
+    assert.equal(await sendDedicatedMonitorAlert(f.args), true);
+    assert.deepEqual(f.messages.map(([id]) => id), [expected]);
+    assert.equal(f.created[0].scopeId, `channel:${expected}`);
+    assert.equal(await sendDedicatedMonitorAlert(f.args), false);
+  });
+}
+test('Instagram dedicated copies never use TikTok subscriptions, DMs or another guild', async () => {
+  const f = monitorFixture('story'); f.args.platform = 'instagram';
+  f.args.config.discordInstagramNewStoriesChannelId = 'stories';
+  for (const target of [
+    { id: 7, platform: 'tiktok', guild_id: 'guild-a', channel_id: 'watch' },
+    { id: 8, platform: 'instagram', guild_id: 'dm:private', channel_id: 'private' },
+    { id: 9, platform: 'instagram', guild_id: 'guild-b', channel_id: 'other-guild' },
+  ]) { f.args.targets = [target]; assert.equal(await sendDedicatedMonitorAlert(f.args), false); }
+  assert.equal(f.messages.length, 0); assert.equal(f.created.length, 0);
+});
+test('Any matching watch already targeting the dedicated channel prevents a duplicate', async () => {
+  const f = monitorFixture(); f.args.platform = 'instagram';
+  f.args.config.discordInstagramNewPostsChannelId = 'videos';
+  f.args.targets = [{ id: 7, platform: 'instagram', guild_id: 'guild-a', channel_id: 'watch' },
+    { id: 8, platform: 'instagram', guild_id: 'guild-a', channel_id: 'videos' }];
+  assert.equal(await sendDedicatedMonitorAlert(f.args), false); assert.equal(f.messages.length, 0);
+});
+test('Instagram channel configuration is optional and whitespace is trimmed', async () => {
+  const { loadConfig } = await import('../src/config.js');
+  assert.equal(loadConfig({}).discordInstagramNewPostsChannelId, '');
+  const c = loadConfig({ DISCORD_INSTAGRAM_NEW_POSTS_CHANNEL_ID: ' posts ', DISCORD_INSTAGRAM_NEW_STORIES_CHANNEL_ID: ' stories ' });
+  assert.equal(c.discordInstagramNewPostsChannelId, 'posts'); assert.equal(c.discordInstagramNewStoriesChannelId, 'stories');
+});
