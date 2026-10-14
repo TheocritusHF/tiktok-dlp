@@ -7,6 +7,7 @@ import {
   platformRegistry as defaultPlatformRegistry,
 } from '../platforms/index.js';
 import { archivePlatformDownload } from '../platforms/archive.js';
+import { INSTAGRAM_ARCHIVE_LAYOUT, removeUnpersistedInstagramFiles } from '../platforms/instagramLayout.js';
 import { extractVideoId, fileSize, makePublicFileUrl, randomToken } from '../util/files.js';
 
 const DEFAULT_MAX_QUEUE_SIZE = 50;
@@ -378,6 +379,7 @@ export class DownloadService {
       ? await archivePlatformDownload(downloaded, {
         downloadDir: this.config.downloadDir,
         now: this.now(),
+        instagramArchiveLayout: this.config.instagramArchiveLayout ?? 'daily',
       })
       : downloaded;
     const extracted = archived?.post && typeof archived.post === 'object'
@@ -470,7 +472,12 @@ export class DownloadService {
           && archived !== downloaded
           && archiveIsConfirmedUnpersisted(this.store, platform, videoId, filePath, this.logger)
         ) {
-          await removeOwnedArchiveDirectory(this.config.downloadDir, extracted.outputDir, this.logger);
+          if (extracted.archiveLayout === INSTAGRAM_ARCHIVE_LAYOUT) {
+            try { await removeUnpersistedInstagramFiles(this.config.downloadDir, extracted); }
+            catch { this.logger?.warn?.('[downloads] Could not remove unpersisted Instagram files; preserving remaining bytes.'); }
+          } else {
+            await removeOwnedArchiveDirectory(this.config.downloadDir, extracted.outputDir, this.logger);
+          }
         }
         throw error;
       }

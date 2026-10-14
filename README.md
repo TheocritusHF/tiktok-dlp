@@ -470,6 +470,17 @@ still needs Cloudflare Access or an equivalent private access layer.
 | Paths/tools | `DATA_DIR`, `STATE_DB`, `DOWNLOAD_DIR`, `YTDLP_PATH`, `YTDLP_PROXY`, `YTDLP_COOKIES_FILE`, `YTDLP_RETRIES`, `YTDLP_TIMEOUT_SECONDS`, `GALLERY_DL_PATH`, `GALLERY_DL_TEMP_DIR`, `GALLERY_DL_TIMEOUT_SECONDS` |
 | Instagram/X sessions | `INSTAGRAM_COOKIES_FILE`, `INSTAGRAM_PROXY`, `X_COOKIES_FILE`, `X_PROXY` |
 
+Future Instagram downloads use `instagram/USERNAME/Stories|Posts|Highlights/YYYY/MM/DD`
+under `DOWNLOAD_DIR`. Date folders and timestamp prefixes are UTC. Media names
+include timestamp, creator and item identity, with ordered `__001`, `__002`, etc.
+suffixes for carousels. ZIP bundles are kept in the daily folder's `_bundles`
+subdirectory. Source media bytes and extensions are preserved. Failure cleanup
+removes only this download's owned files, never the shared daily directory.
+
+Set `INSTAGRAM_ARCHIVE_LAYOUT=legacy` to keep per-item folders for future downloads.
+Existing files and database paths are not moved on startup; their current links
+remain valid. TikTok and X retain their existing archive layouts.
+
 Optional `DISCORD_INSTAGRAM_NEW_POSTS_CHANNEL_ID` and
 `DISCORD_INSTAGRAM_NEW_STORIES_CHANNEL_ID` add dedicated Instagram archive copies.
 The existing watch channel still receives its notification. Photo and video
