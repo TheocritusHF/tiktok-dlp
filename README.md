@@ -1,12 +1,10 @@
 # tiktok-dlp
 
-> **TheocritusHF fork v1.0.1:** This patch release updates the first full
-> release with privacy fixes for authenticated media, LIVE cookie copies, and
-> Rewind's playback cache. Read the [release notes](RELEASE_NOTES_v1.0.1.md)
-> and [installation guide](RELEASE_PREVIEW.md). It includes
-> [proposals #23–#29](RELEASE_PREVIEW.md) and the tested upstream integration.
-> Optional LIVE recording, quality rechecks, and dedicated notification channels
-> remain off until configured.
+> **TheocritusHF fork v1.1.0:** Instagram source-quality video downloads,
+> dedicated post/Story channels, daily archive folders, and an explicit offline
+> migration with rollback. Includes the v1.0.1 privacy fixes. Read the
+> [release notes](RELEASE_NOTES_v1.1.0.md) and [installation guide](RELEASE_PREVIEW.md).
+> Publishing a release does not update an existing local bot.
 
 Self-hosted social-media downloader and archive for TikTok, Instagram, and X,
 with TikTok monitoring and full-profile imports plus **Rewind**: a private,
