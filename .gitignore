@@ -9,3 +9,14 @@ AGENTS.md
 tiktok-spec.md
 
 __pycache__/
+
+# Private migration artifacts must never enter source control.
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+**/stopped-plan.json
+**/before-state.json
+**/migration-journal.json
+instagram-layout-plan*.json
