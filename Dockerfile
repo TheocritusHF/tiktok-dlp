@@ -15,11 +15,11 @@ RUN apt-get update \
     tzdata \
   && python3 -m pip install --no-cache-dir --break-system-packages \
     'curl_cffi>=0.10' \
-    'gallery-dl==1.32.14' \
+    'gallery-dl==1.32.16' \
     'Pillow>=8.1.1' \
     'instagrapi==3.0.16' \
   && python3 -c 'import curl_cffi; import instagrapi; print(instagrapi.__name__)' \
-  && test "$(gallery-dl --version)" = "1.32.14" \
+  && test "$(gallery-dl --version)" = "1.32.16" \
   && curl --fail --location --retry 3 \
     https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp \
     --output /usr/local/bin/yt-dlp \
@@ -30,10 +30,8 @@ RUN apt-get update \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/*
 
-COPY scripts/patch-gallery-dl.py /tmp/patch-gallery-dl.py
-RUN python3 /tmp/patch-gallery-dl.py \
-  && python3 /tmp/patch-gallery-dl.py --verify \
-  && rm /tmp/patch-gallery-dl.py
+COPY scripts/verify-gallery-dl.py /tmp/verify-gallery-dl.py
+RUN python3 /tmp/verify-gallery-dl.py && rm /tmp/verify-gallery-dl.py
 
 COPY package*.json ./
 

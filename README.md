@@ -142,7 +142,7 @@ Recommended production setup:
 For direct local development:
 
 - Node.js `>=22.13.0`
-- `yt-dlp`, `gallery-dl` 1.32.14, and ffmpeg for backend download work
+- `yt-dlp`, `gallery-dl` 1.32.16, and ffmpeg for backend download work
 - Python 3 and ffmpeg for the live Rewind metadata and thumbnail fallbacks
 
 ## Quick start with Docker
@@ -527,12 +527,12 @@ to work around a restriction. Automated access can still lead to account
 restrictions; use an approved API/integration where it supports the needed
 content if account reliability is essential.
 
-The Docker build applies `scripts/patch-gallery-dl.py` to pinned gallery-dl
-1.32.14: Instagram merged-video variants may omit width/height, which are
-reported as unknown without changing the selected MP4. The build tests the
-real parser with missing and present dimensions and an image Story. The patch
-intentionally rejects a different gallery-dl version or source layout; review
-and remove it when upgrading to an upstream release that passes those cases.
+The Docker build pins gallery-dl 1.32.16 and runs the read-only
+`scripts/verify-gallery-dl.py` parser checks. This release handles Instagram
+video variants without width/height fields, so the old source patch is no
+longer applied. Probe dimensions can fall back to the original post dimensions;
+they do not prove the resolution of a downloaded video. Review the fixtures
+when changing the dependency version. Builds do not update dependencies at runtime.
 
 If TikTok requires a logged-in session, export a **full** Netscape `tiktok.com`
 cookie jar (not a hand-picked subset). The working live path needed

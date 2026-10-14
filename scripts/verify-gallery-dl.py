@@ -1,32 +1,13 @@
-"""Compatibility fix for Instagram video variants without optional dimensions.
-
-gallery-dl 1.32.14 assumes merged video variants always have width/height.
-Instagram stories can return only type/url. Keep the chosen MP4 and report
-unknown dimensions (0); original dimensions need not describe that variant.
-Remove this patch when a pinned upstream release handles these fields.
-"""
+"""Read-only regression verification for the pinned gallery-dl Instagram parser."""
 import copy
-from pathlib import Path
 
 from gallery_dl import extractor, version
 from gallery_dl.extractor import instagram
 
 
-def patch():
-    if version.__version__ != "1.32.14":
-        raise RuntimeError("Review Instagram compatibility patch after gallery-dl upgrade")
-    source_path = Path(instagram.__file__)
-    source = source_path.read_text()
-    for dimension in ("width", "height"):
-        old = f'{dimension} = video["{dimension}"]'
-        new = f'{dimension} = video.get("{dimension}", 0)'
-        if source.count(old) != 1:
-            raise RuntimeError(f"Unexpected gallery-dl {dimension} implementation")
-        source = source.replace(old, new)
-    source_path.write_text(source)
-
-
 def verify():
+    if version.__version__ != "1.32.16":
+        raise RuntimeError("Review parser verification after gallery-dl upgrade")
     # Reduced response shape observed September 30, 2026; no account data or
     # signed CDN URLs. Exercise the actual installed parser without networking.
     item = {
@@ -50,7 +31,13 @@ def verify():
     parser._warn_video = False
     parsed = parser._parse_post(copy.deepcopy(post))["_files"][0]
     assert parsed["video_url"] == item["video_versions"][-1]["url"]
-    assert (parsed["width"], parsed["height"]) == (0, 0)
+    assert (parsed["width"], parsed["height"]) == (1080, 1920)
+    # Upstream falls back to original dimensions; these are probe hints.
+    sparse = copy.deepcopy(post)
+    sparse["items"][0].pop("original_width")
+    sparse["items"][0].pop("original_height")
+    parsed_sparse = parser._parse_post(sparse)["_files"][0]
+    assert (parsed_sparse["width"], parsed_sparse["height"]) == (0, 0)
     item["video_versions"][-1].update(width=720, height=1280)
     parsed = parser._parse_post(copy.deepcopy(post))["_files"][0]
     assert (parsed["width"], parsed["height"]) == (720, 1280)
@@ -62,8 +49,4 @@ def verify():
 
 
 if __name__ == "__main__":
-    import sys
-    if "--verify" in sys.argv:
-        verify()
-    else:
-        patch()
+    verify()
