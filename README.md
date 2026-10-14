@@ -261,6 +261,9 @@ portal.
 Watch management requires Manage Server, `WATCH_MANAGER_ROLE_ID`, or
 `DISCORD_OWNER_ID` in DMs. Watches are subscribed per guild/DM, so multiple
 destinations can follow one creator without duplicating the underlying scan.
+The same username can be watched separately on Instagram and TikTok; each platform
+keeps its own check timing and failure backoff. If accessible Stories are missing
+despite recent successful checks, see [same-name watch diagnosis](docs/WATCH_PLATFORM_ISOLATION.md).
 After five consecutive extractor failures, a monitored post stops retrying
 automatically and appears in `/watch failures`; a permitted watch manager in a
 subscribed server or DM can run `/watch retry` without exposing another scope's
