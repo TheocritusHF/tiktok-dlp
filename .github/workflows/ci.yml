@@ -29,6 +29,12 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Verify pinned gallery-dl parser
+        run: |
+          python3 -m venv /tmp/gallery-dl-check
+          /tmp/gallery-dl-check/bin/pip install 'gallery-dl==1.32.16'
+          /tmp/gallery-dl-check/bin/python scripts/verify-gallery-dl.py
+
       - name: Run backend tests
         run: npm test
         env:
