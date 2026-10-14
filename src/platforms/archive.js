@@ -1,3 +1,4 @@
+import { archiveInstagramDownload } from './instagramLayout.js';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { createZipFile } from '../tiktok/ytdlp.js';
@@ -7,7 +8,9 @@ import { normalizePlatform } from './references.js';
 export async function archivePlatformDownload(downloaded, {
   downloadDir,
   now = Date.now(),
+  instagramArchiveLayout = 'daily',
 } = {}) {
+  if (!['daily', 'legacy'].includes(instagramArchiveLayout)) throw new Error('Invalid Instagram archive layout.');
   if (!downloadDir) throw new Error('A download directory is required to archive platform media.');
   const post = downloaded?.post && typeof downloaded.post === 'object' ? downloaded.post : {};
   let platform;
@@ -26,6 +29,10 @@ export async function archivePlatformDownload(downloaded, {
   const rootFromSource = path.relative(sourceDir, downloadRoot);
   if (!rootFromSource || (!rootFromSource.startsWith('..') && !path.isAbsolute(rootFromSource))) {
     throw new Error('The adapter staging directory must not contain the configured download directory.');
+  }
+
+  if (platform === 'instagram' && instagramArchiveLayout === 'daily') {
+    return archiveInstagramDownload(downloaded, { downloadDir, now, createZip: createZipFile });
   }
 
   const publishedAt = normalizeDate(post.publishedAt, now);

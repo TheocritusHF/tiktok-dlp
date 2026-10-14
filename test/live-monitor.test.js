@@ -154,8 +154,13 @@ test('one detected LIVE records, archives, and sends each alert once', async () 
     assert.equal((await stat(record.filePath)).size, 128 * 1024);
     assert.equal(starts.length, 1);
     assert.equal(completes[0].partial, false);
-    const sessions = await readdir(path.join(dir, 'live', 'sessions'));
-    assert.equal(JSON.parse(await readFile(path.join(dir, 'live', 'sessions', sessions[0]), 'utf8')).phase, 'complete');
+    const sessionPath = path.join(dir, 'live', 'sessions', `${completes[0].sessionId}.json`);
+    // Notification completion precedes the final atomic journal rename.
+    // Observe that committed JSON, never a transient .tmp directory entry.
+    await until(async () => {
+      try { return JSON.parse(await readFile(sessionPath, 'utf8')).phase === 'complete'; }
+      catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+    });
   } finally {
     await worker.stop();
     await rm(dir, { force: true, recursive: true });

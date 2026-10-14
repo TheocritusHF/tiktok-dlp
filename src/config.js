@@ -102,6 +102,7 @@ export function loadConfig(env = process.env, cwd = process.cwd()) {
     galleryDlMaxAssets: parsePositiveInt(env.GALLERY_DL_MAX_ASSETS, 20),
     galleryDlMaxItemBytes: galleryDlItemLimitMb * 1024 * 1024,
     galleryDlMaxTotalBytes: galleryDlTotalLimitMb * 1024 * 1024,
+    instagramArchiveLayout: parseInstagramArchiveLayout(env.INSTAGRAM_ARCHIVE_LAYOUT),
     instagramCookiesFile: env.INSTAGRAM_COOKIES_FILE ? resolvePath(env.INSTAGRAM_COOKIES_FILE, cwd) : '',
     instagramProxy: String(env.INSTAGRAM_PROXY ?? '').trim(),
     instagramHighlightsHandles: String(env.INSTAGRAM_HIGHLIGHTS_HANDLES ?? env.HIGHLIGHTS_HANDLES ?? '')
@@ -163,4 +164,10 @@ export function validateRuntimeConfig(config, { requireDiscord = true } = {}) {
 
 function resolvePath(value, cwd) {
   return path.isAbsolute(value) ? value : path.resolve(cwd, value);
+}
+
+function parseInstagramArchiveLayout(value) {
+  const layout = String(value ?? 'daily').trim().toLowerCase();
+  if (!['daily', 'legacy'].includes(layout)) throw new Error('INSTAGRAM_ARCHIVE_LAYOUT must be daily or legacy.');
+  return layout;
 }

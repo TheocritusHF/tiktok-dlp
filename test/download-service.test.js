@@ -875,7 +875,9 @@ test('DownloadService removes an uncommitted platform archive when persistence f
       /simulated commit failure/,
     );
     assert.ok(archivedPath);
-    await assert.rejects(access(path.dirname(archivedPath)), { code: 'ENOENT' });
+    await assert.rejects(access(archivedPath), { code: 'ENOENT' });
+    // A daily directory is shared and must survive persistence cleanup.
+    await access(path.dirname(archivedPath));
     assert.equal(store.stats().fileCount, 0);
   } finally {
     store.close();
